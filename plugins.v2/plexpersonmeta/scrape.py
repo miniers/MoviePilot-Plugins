@@ -845,3 +845,4 @@ class ScrapeHelper:
         self.cache_backend.clear(region="plex_tmdb_media")
         self.cache_backend.clear(region="plex_tmdb_person")
         self.cache_backend.clear(region="plex_douban_media")
+        self.cache_backend.close()

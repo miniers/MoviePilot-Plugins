@@ -4,11 +4,15 @@ helper.py
 这个模块定义了用于存储媒体项目信息的 `RatingInfo` 数据类以及缓存、限流等装饰器
 """
 import functools
+import hashlib
 from dataclasses import dataclass
 from typing import Optional
 
-from app.core.cache import cache_backend
+from app.core.cache import Cache
 from app.log import logger
+
+# 创建缓存实例
+cache_backend = Cache(maxsize=100000, ttl=60 * 60 * 24 * 3)
 
 
 @dataclass
@@ -35,11 +39,18 @@ def cache_with_logging(region, source):
 
         @functools.wraps(func)
         def wrapped_func(*args, **kwargs):
-            key = cache_backend.get_cache_key(func, args, kwargs)
-            exists_cache = cache_backend.exists(key=key, region=region)
+            # 生成缓存键
+            func_name = func.__name__
+            args_str = str(args) + str(sorted(kwargs.items()))
+            key = hashlib.md5((func_name + args_str).encode()).hexdigest()
+            
+            exists_cache = cache_backend.exists(key, region=region)
             if exists_cache:
-                value = cache_backend.get(key=key, region=region)
+                value = cache_backend.get(key, region=region)
                 if value is not None:
+                    if value == "None":
+                        logger.info(f"从缓存中获取到 {source} 信息为 None，可能是之前触发限流或网络异常")
+                        return None
                     if source == "PERSON":
                         logger.info(f"从缓存中获取到 {source} 人物信息")
                     else:
@@ -52,10 +63,10 @@ def cache_with_logging(region, source):
 
             if result is None:
                 # 如果结果为 None，说明触发限流或网络等异常，缓存5分钟，以免高频次调用
-                cache_backend.set(key, "None", ttl=60 * 5, region=region, maxsize=100000)
+                cache_backend.set(key, "None", region=region)
             else:
                 # 结果不为 None，使用默认 TTL 缓存
-                cache_backend.set(key, result, ttl=60 * 60 * 24 * 3, region=region, maxsize=100000)
+                cache_backend.set(key, result, region=region)
 
             return result
 
