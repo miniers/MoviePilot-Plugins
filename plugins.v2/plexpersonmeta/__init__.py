@@ -50,6 +50,8 @@ class PlexPersonMeta(_PluginBase):
     _onlyonce = False
     # 任务执行间隔
     _cron = None
+    # 最近一次定时任务运行的入库时间范围，单位分钟
+    _cron_added_time = None
     # 发送通知
     _notify = False
     # 需要处理的媒体库
@@ -88,6 +90,12 @@ class PlexPersonMeta(_PluginBase):
         # 如果开启了入库后运行一次，延迟时间又不填，默认为200s
         if self._execute_transfer and not self._delay:
             self._delay = 200
+
+        # 最近一次定时任务运行的入库时间范围，单位分钟
+        try:
+            self._cron_added_time = int(config.get("cron_added_time", 0))
+        except ValueError:
+            self._cron_added_time = 0
 
         # 停止现有任务
         self.stop_service()
@@ -400,7 +408,7 @@ class PlexPersonMeta(_PluginBase):
                                 'component': 'VCol',
                                 'props': {
                                     'cols': 12,
-                                    'md': 4
+                                    'md': 3
                                 },
                                 'content': [
                                     {
@@ -419,7 +427,26 @@ class PlexPersonMeta(_PluginBase):
                                 'component': 'VCol',
                                 'props': {
                                     'cols': 12,
-                                    'md': 4
+                                    'md': 3
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'cron_added_time',
+                                            'label': '刮削时间范围',
+                                            'placeholder': '指定定时刮削的入库时间范围（分钟）',
+                                            'hint': '定时刮削时，指定入库时间范围（分钟），如 60，表示只刮削最近60分钟入库的媒体，留空或0表示刮削所有媒体',
+                                            'persistent-hint': True
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 3
                                 },
                                 'content': [
                                     {
@@ -438,7 +465,7 @@ class PlexPersonMeta(_PluginBase):
                                 'component': 'VCol',
                                 'props': {
                                     'cols': 12,
-                                    'md': 4
+                                    'md': 3
                                 },
                                 'content': [
                                     {
@@ -879,6 +906,13 @@ class PlexPersonMeta(_PluginBase):
         刮削媒体库中所有媒体的演员信息
         """
         if not self.__check_plex_media_server():
+            return
+        
+        # 如果设置了最近一次定时任务运行的入库时间范围，则优先处理该逻辑
+        if self._cron_added_time and self._cron_added_time > 0:
+            logger.info(f"定时刮削，准备刮削最近 {self._cron_added_time} 分钟入库的媒体")
+            added_time = datetime.now(tz=pytz.timezone(settings.TZ)) - timedelta(minutes=self._cron_added_time)
+            self.scrap_library_by_added_time(added_time=int(added_time.timestamp()))
             return
 
         with lock:
