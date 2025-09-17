@@ -3,7 +3,7 @@
         "name": "Plex演职人员刮削",
         "description": "实现刮削演职人员中文名称及角色。",
         "labels": "Plex,刮削",
-        "version": "2.2",
+        "version": "2.3",
         "icon": "https://raw.githubusercontent.com/miniers/MoviePilot-Plugins/main/icons/plexpersonmeta.png",
         "author": "miniers",
         "level": 1,
