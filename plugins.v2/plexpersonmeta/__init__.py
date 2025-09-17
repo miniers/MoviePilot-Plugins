@@ -912,7 +912,7 @@ class PlexPersonMeta(_PluginBase):
         if self._cron_added_time and self._cron_added_time > 0:
             logger.info(f"定时刮削，准备刮削最近 {self._cron_added_time} 分钟入库的媒体")
             added_time = datetime.now(tz=pytz.timezone(settings.TZ)) - timedelta(minutes=self._cron_added_time)
-            self.scrap_library_by_added_time(added_time=int(added_time.timestamp()))
+            self.scrape_library_by_added_time(added_time=int(added_time.timestamp()))
             return
 
         with lock:
