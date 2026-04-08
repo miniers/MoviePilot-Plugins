@@ -1,6 +1,6 @@
 import tempfile
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import requests
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
@@ -17,6 +17,13 @@ def _truetype_font(asset_root: Path, name: str, size: int):
         return ImageFont.truetype(str(candidate), size)
     except Exception:
         return None
+
+
+def _ascii_duration_text(duration_text: str) -> str:
+    if not duration_text:
+        return ""
+    text = duration_text.replace("小时", "h").replace("分钟", "m").replace(" ", "")
+    return text
 
 
 def download_poster(poster_url: str, timeout: int = 60) -> Optional[Path]:
@@ -39,15 +46,28 @@ def is_overlay_poster(poster_path: Path) -> bool:
         return False
 
 
-def _load_badge(asset_root: Path, folder: str, name: str, height: int) -> Optional[Image.Image]:
+def _load_badge(
+    asset_root: Path,
+    folder: str,
+    name: str,
+    height: int,
+    debug_log: Optional[Callable[[str], None]] = None,
+) -> Optional[Image.Image]:
     if not name:
         return None
     candidate = asset_root / "overlays" / "img" / folder / f"{name}.png"
     if not candidate.exists():
+        if debug_log:
+            debug_log(f"徽标资源不存在: {candidate}")
         return None
     try:
-        image = Image.open(candidate).convert("RGBA")
-    except Exception:
+        image = Image.open(candidate)
+        image.load()
+        image = image.convert("RGBA")
+    except Exception as err:
+        if debug_log:
+            size_hint = candidate.stat().st_size if candidate.exists() else 0
+            debug_log(f"加载徽标资源失败: {candidate} ({size_hint} bytes) - {err}")
         return None
     width = int(height * image.width / image.height)
     return image.resize((width, height), Image.LANCZOS)
@@ -120,6 +140,7 @@ def _build_reference_overlay(
     dynamic_range: str,
     duration_text: str,
     rating_text: str,
+    debug_log: Optional[Callable[[str], None]] = None,
 ) -> Path:
     original_image = Image.open(poster_path).convert("RGBA")
     original_width, original_height = original_image.size
@@ -225,28 +246,49 @@ def _build_reference_overlay(
     x_resolution = int(x + 22 * scale)
     y_resolution = int(y + bar_height / 2 - badge_height / 2)
 
-    resolution_badge = _load_badge(asset_root, "empty", resolution, badge_height)
+    resolution_badge = _load_badge(asset_root, "empty", resolution, badge_height, debug_log)
+    draw = ImageDraw.Draw(poster)
+    badge_text_font_size = int(42 * scale)
+    badge_text_font = _truetype_font(asset_root, "ALIBABA_Bold.otf", badge_text_font_size)
+    resolution_badge_width = 0
     if resolution_badge:
         resolution_image = Image.new("RGBA", (poster_width, poster_height))
         resolution_image.paste(resolution_badge, (x_resolution, y_resolution))
         poster = Image.alpha_composite(poster, resolution_image)
+        resolution_badge_width = resolution_badge.width
     else:
-        resolution_badge = Image.new("RGBA", (0, badge_height))
+        resolution_text = resolution or ""
+        if resolution_text and badge_text_font:
+            draw.text((x_resolution, y_resolution + 7 * scale), resolution_text, fill=(255, 255, 255, 255), font=badge_text_font)
+            resolution_badge_width = int(draw.textlength(resolution_text, badge_text_font))
 
-    x_dynamic_range = int(x_resolution + resolution_badge.width + 20 * scale)
-    dynamic_range_badge = _load_badge(asset_root, "empty", dynamic_range, badge_height)
+    x_dynamic_range = int(x_resolution + resolution_badge_width + 20 * scale)
+    dynamic_range_badge = _load_badge(asset_root, "empty", dynamic_range, badge_height, debug_log)
+    dynamic_range_badge_width = 0
     if dynamic_range_badge:
         dynamic_range_image = Image.new("RGBA", (poster_width, poster_height))
         dynamic_range_image.paste(dynamic_range_badge, (x_dynamic_range, y_resolution))
         poster = Image.alpha_composite(poster, dynamic_range_image)
+        dynamic_range_badge_width = dynamic_range_badge.width
     else:
-        dynamic_range_badge = Image.new("RGBA", (0, badge_height))
+        dynamic_range_text = dynamic_range or ""
+        if dynamic_range_text and badge_text_font:
+            draw.text((x_dynamic_range, y_resolution + 7 * scale), dynamic_range_text, fill=(255, 255, 255, 255), font=badge_text_font)
+            dynamic_range_badge_width = int(draw.textlength(dynamic_range_text, badge_text_font))
 
-    draw = ImageDraw.Draw(poster)
     duration_font_size = int((51 if dynamic_range == "DV" and mode == "movie" else 54) * scale)
     rating_font_size = int(75 * scale)
     duration_font = _truetype_font(asset_root, "fzlth.ttf", duration_font_size)
     rating_font = _truetype_font(asset_root, "ALIBABA_Bold.otf", rating_font_size)
+    if duration_text and not duration_font:
+        duration_font = ImageFont.load_default()
+        duration_text = _ascii_duration_text(duration_text)
+        if debug_log:
+            debug_log(f"时长字体加载失败，已回退为 ASCII 文本: {duration_text}")
+    if rating_text and not rating_font:
+        rating_font = ImageFont.load_default()
+        if debug_log:
+            debug_log("评分字体加载失败，已回退为默认字体")
 
     duration_width = int(draw.textlength(duration_text, duration_font)) if duration_text and duration_font else 0
     rating_width = int(draw.textlength(rating_text, rating_font)) if rating_text and rating_font else 0
@@ -254,9 +296,9 @@ def _build_reference_overlay(
 
     y_duration = int(y + bar_height / 2 - text_height / 2)
     if mode == "movie":
-        x_duration = int(x_resolution + resolution_badge.width + 20 * scale + dynamic_range_badge.width + 22 * scale)
+        x_duration = int(x_resolution + resolution_badge_width + 20 * scale + dynamic_range_badge_width + 22 * scale)
     else:
-        x_duration = int(x_resolution + resolution_badge.width + 20 * scale + dynamic_range_badge.width + 30 * scale)
+        x_duration = int(x_resolution + resolution_badge_width + 20 * scale + dynamic_range_badge_width + 30 * scale)
     y_rating = int(y + bar_height / 2 - text_height / 2)
 
     if duration_text and duration_font:
@@ -290,6 +332,7 @@ def build_overlay_poster(
     dynamic_range: str,
     duration_text: str,
     rating_text: str,
+    debug_log: Optional[Callable[[str], None]] = None,
 ) -> Path:
     return _build_reference_overlay(
         poster_path=poster_path,
@@ -298,4 +341,5 @@ def build_overlay_poster(
         dynamic_range=dynamic_range,
         duration_text=duration_text,
         rating_text=rating_text,
+        debug_log=debug_log,
     )

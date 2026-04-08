@@ -27,7 +27,7 @@ class MPPlexTools(_PluginBase):
     plugin_name = "MP Plex工具箱"
     plugin_desc = "为 MoviePilot V2 提供 Plex 中文本地化、Fanart 封面优选和海报信息叠加。"
     plugin_icon = "https://github.com/miniers/MoviePilot-Plugins/blob/main/icons/mpplextools.jpg?raw=true"
-    plugin_version = "0.1.3"
+    plugin_version = "0.1.4"
     plugin_author = "miniers"
     author_url = "https://github.com/miniers/MoviePilot-Plugins"
     plugin_config_prefix = "mpplextools_"
@@ -724,6 +724,7 @@ class MPPlexTools(_PluginBase):
             dynamic_range=dynamic_range,
             duration_text=duration_text,
             rating_text=rating_text,
+            debug_log=lambda message: self._verbose(f"{getattr(item, 'title', 'unknown')} {message}"),
         )
         item.uploadPoster(filepath=str(overlay_path))
         self._verbose(f"{getattr(item, 'title', 'unknown')} 海报叠加完成并已上传: {overlay_path}")
@@ -763,6 +764,12 @@ class MPPlexTools(_PluginBase):
             if getattr(poster, "selected", False):
                 continue
             key = getattr(poster, "key", "") or ""
+            if key.startswith(("http://", "https://")):
+                url = key
+                if url not in seen:
+                    seen.add(url)
+                    urls.append(url)
+                continue
             poster_server = getattr(poster, "_server", None) or server
             if not key or not poster_server or not hasattr(poster_server, "url"):
                 continue
@@ -842,34 +849,87 @@ class MPPlexTools(_PluginBase):
         parts = getattr(media, "parts", None) or []
         return parts if isinstance(parts, list) else list(parts)
 
+    def _preferred_media(self, item):
+        media_list = self._safe_media_list(item)
+        if media_list:
+            return media_list[0]
+
+        item_type = getattr(item, "type", "")
+        children = []
+        try:
+            if item_type == "show":
+                children = getattr(item, "episodes", lambda: [])() or []
+            elif item_type == "season":
+                children = getattr(item, "episodes", lambda: [])() or []
+            elif item_type == "movie":
+                children = getattr(item, "versions", lambda: [])() or []
+        except Exception as err:
+            self._verbose(f"{getattr(item, 'title', 'unknown')} 获取子媒体失败: {err}")
+            children = []
+
+        for child in children:
+            child_media = self._safe_media_list(child)
+            if child_media:
+                return child_media[0]
+        return None
+
+    @staticmethod
+    def _stream_display_title(media) -> str:
+        parts = getattr(media, "parts", None) or []
+        if not parts:
+            return ""
+        streams = getattr(parts[0], "streams", None) or []
+        if not streams:
+            return ""
+        for stream in streams:
+            stream_type = getattr(stream, "streamType", None)
+            if stream_type in (1, "1"):
+                return str(getattr(stream, "displayTitle", "") or "").lower()
+        return str(getattr(streams[0], "displayTitle", "") or "").lower()
+
+    def _item_rating_text(self, item) -> str:
+        candidates = [item]
+        try:
+            item_type = getattr(item, "type", "")
+            if item_type in {"show", "season"}:
+                episodes = getattr(item, "episodes", lambda: [])() or []
+                candidates.extend(episodes[:5])
+        except Exception as err:
+            self._verbose(f"{getattr(item, 'title', 'unknown')} 获取评分候选失败: {err}")
+
+        for candidate in candidates:
+            rating = getattr(candidate, "audienceRating", None) or getattr(candidate, "rating", None)
+            if rating in [None, ""]:
+                continue
+            try:
+                return f"{float(rating):.1f}"
+            except Exception:
+                continue
+        return ""
+
     def _media_overlay_info(self, item) -> Tuple[str, str, str, str]:
         resolution = ""
         dynamic_range = "SDR"
         duration_text = ""
         rating_text = ""
         try:
-            media_list = self._safe_media_list(item)
-            if not media_list:
+            media = self._preferred_media(item)
+            if not media:
                 return resolution, dynamic_range, duration_text, rating_text
-            media = media_list[0]
             resolution_raw = str(getattr(media, "videoResolution", "") or "").lower()
             resolution = resolution_raw.upper() if resolution_raw == "4k" else f"{resolution_raw.upper()}P" if resolution_raw else ""
-            parts = self._safe_parts(media)
-            display_title = ""
-            if parts and getattr(parts[0], "streams", None):
-                streams = parts[0].streams or []
-                if streams:
-                    display_title = str(getattr(streams[0], "displayTitle", "") or "").lower()
+            display_title = self._stream_display_title(media)
             if "dovi" in display_title or " dv" in display_title:
                 dynamic_range = "DV"
             elif "hdr" in display_title:
                 dynamic_range = "HDR"
             duration_ms = int(getattr(item, "duration", 0) or 0)
+            if not duration_ms:
+                duration_ms = int(getattr(media, "duration", 0) or 0)
             duration_text = self._format_duration(duration_ms)
-            rating = getattr(item, "audienceRating", None) or getattr(item, "rating", None)
-            rating_text = f"{float(rating):.1f}" if rating not in [None, ""] else ""
-        except Exception:
-            pass
+            rating_text = self._item_rating_text(item)
+        except Exception as err:
+            self._verbose(f"{getattr(item, 'title', 'unknown')} 提取海报叠加信息失败: {err}")
         return resolution, dynamic_range, duration_text, rating_text
 
     @staticmethod
