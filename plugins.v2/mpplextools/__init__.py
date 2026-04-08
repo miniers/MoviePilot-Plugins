@@ -1,3 +1,4 @@
+import copy
 import json
 import threading
 import time
@@ -27,7 +28,7 @@ class MPPlexTools(_PluginBase):
     plugin_name = "MP Plex工具箱"
     plugin_desc = "为 MoviePilot V2 提供 Plex 中文本地化、Fanart 封面优选和海报信息叠加。"
     plugin_icon = "https://github.com/miniers/MoviePilot-Plugins/blob/main/icons/mpplextools.jpg?raw=true"
-    plugin_version = "0.1.1"
+    plugin_version = "0.1.2"
     plugin_author = "miniers"
     author_url = "https://github.com/miniers/MoviePilot-Plugins"
     plugin_config_prefix = "mpplextools_"
@@ -48,6 +49,7 @@ class MPPlexTools(_PluginBase):
     _fanart = True
     _overlay_poster = False
     _lock_metadata = False
+    _verbose_logging = False
     _collection = False
     _run_mode = "run_all"
     _recent_limit = 10
@@ -111,6 +113,7 @@ class MPPlexTools(_PluginBase):
         self._fanart = bool(config.get("fanart", True))
         self._overlay_poster = bool(config.get("overlay_poster", False))
         self._lock_metadata = bool(config.get("lock_metadata", False))
+        self._verbose_logging = bool(config.get("verbose_logging", False))
         self._collection = bool(config.get("collection", False))
         self._run_mode = config.get("run_mode") or "run_all"
         try:
@@ -152,6 +155,7 @@ class MPPlexTools(_PluginBase):
             "fanart": self._fanart,
             "overlay_poster": self._overlay_poster,
             "lock_metadata": self._lock_metadata,
+            "verbose_logging": self._verbose_logging,
             "collection": self._collection,
             "run_mode": self._run_mode,
             "cron": self._cron,
@@ -284,13 +288,18 @@ class MPPlexTools(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
+                                "props": {"cols": 12, "md": 4},
                                 "content": [{"component": "VSwitch", "props": {"model": "overlay_poster", "label": "海报叠加媒体信息"}}],
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
+                                "props": {"cols": 12, "md": 4},
                                 "content": [{"component": "VSwitch", "props": {"model": "lock_metadata", "label": "整理后锁定相关元数据"}}],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [{"component": "VSwitch", "props": {"model": "verbose_logging", "label": "输出详细日志"}}],
                             },
                         ],
                     },
@@ -377,33 +386,60 @@ class MPPlexTools(_PluginBase):
                             {
                                 "component": "VCol",
                                 "props": {"cols": 12},
-                                "content": [{"component": "VAceEditor", "props": {"modelvalue": "custom_tags_json", "lang": "json", "theme": "monokai", "style": "height: 20rem"}}],
+                                "content": [{"component": "VAceEditor", "props": {"model": "custom_tags_json", "lang": "json", "theme": "monokai", "style": "height: 20rem"}}],
                             }
                         ],
                     },
                 ],
             }
-        ], {
-            "enabled": False,
+        ], self._form_defaults()
+
+    def _form_defaults(self) -> Dict[str, Any]:
+        return {
+            "enabled": self._enabled,
             "onlyonce": False,
-            "notify": True,
-            "execute_transfer": True,
-            "translate_tags": True,
-            "sort_title": True,
-            "fanart": True,
-            "overlay_poster": False,
-            "lock_metadata": False,
-            "collection": False,
-            "run_mode": "run_all",
-            "cron": "30 3 * * *",
-            "delay": 180,
-            "recent_limit": 10,
-            "batch_size": 100,
-            "custom_tags_json": self._preset_tags_json(),
+            "notify": self._notify,
+            "execute_transfer": self._execute_transfer,
+            "translate_tags": self._translate_tags,
+            "sort_title": self._sort_title,
+            "fanart": self._fanart,
+            "overlay_poster": self._overlay_poster,
+            "lock_metadata": self._lock_metadata,
+            "verbose_logging": self._verbose_logging,
+            "collection": self._collection,
+            "run_mode": self._run_mode,
+            "cron": self._cron or "30 3 * * *",
+            "delay": self._delay,
+            "recent_limit": self._recent_limit,
+            "batch_size": self._batch_size,
+            "mediaservers": self._mediaservers,
+            "libraries": self._libraries,
+            "custom_tags_json": self._custom_tags_json or self._preset_tags_json(),
         }
 
+    def _apply_model_values(self, components: List[dict], values: Dict[str, Any]) -> List[dict]:
+        hydrated = copy.deepcopy(components)
+
+        def walk(node: Any):
+            if isinstance(node, list):
+                for item in node:
+                    walk(item)
+                return
+            if not isinstance(node, dict):
+                return
+            props = node.get("props")
+            if isinstance(props, dict):
+                model_key = props.get("model")
+                if model_key in values:
+                    props["modelValue"] = values[model_key]
+            for value in node.values():
+                walk(value)
+
+        walk(hydrated)
+        return hydrated
+
     def get_page(self) -> List[dict]:
-        page_form, _ = self.get_form()
+        page_form, data = self.get_form()
         header = {
             "component": "VRow",
             "content": [
@@ -423,7 +459,7 @@ class MPPlexTools(_PluginBase):
                 }
             ]
         }
-        return [header] + page_form
+        return [header] + self._apply_model_values(page_form, data)
 
 
     def stop_service(self):
@@ -725,15 +761,13 @@ class MPPlexTools(_PluginBase):
         item_type = getattr(item, "type", "")
         if item_type not in {"movie", "show", "season", "episode"}:
             return
-        poster_url = getattr(item, "posterUrl", "") or ""
-        if not poster_url:
-            return
-        poster_path = download_poster(poster_url)
+        poster_path = self._source_poster_path(item)
         if not poster_path:
             return
-        if is_overlay_poster(poster_path):
-            return
         resolution, dynamic_range, duration_text, rating_text = self._media_overlay_info(item)
+        self._verbose(
+            f"{getattr(item, 'title', 'unknown')} 海报叠加参数: 分辨率={resolution or '-'} 动态范围={dynamic_range or '-'} 时长={duration_text or '-'} 评分={rating_text or '-'}"
+        )
         overlay_path = build_overlay_poster(
             poster_path=poster_path,
             asset_root=Path(__file__).resolve().parent,
@@ -744,8 +778,113 @@ class MPPlexTools(_PluginBase):
             rating_text=rating_text,
         )
         item.uploadPoster(filepath=str(overlay_path))
+        self._verbose(f"{getattr(item, 'title', 'unknown')} 海报叠加完成并已上传: {overlay_path}")
         if self._lock_metadata:
             item.lockPoster()
+
+    def _verbose(self, message: str):
+        if self._verbose_logging:
+            logger.info(f"[{self.plugin_name}][调试] {message}")
+
+    def _poster_backup_path(self, item) -> Optional[Path]:
+        try:
+            base_dir = Path(self.get_data_path()) if hasattr(self, "get_data_path") else Path("/tmp") / "mpplextools"
+            backup_dir = base_dir / "poster_backup"
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            rating_key = getattr(item, "ratingKey", None) or getattr(item, "key", None) or getattr(item, "title", "unknown")
+            safe_key = str(rating_key).strip("/").replace("/", "_").replace(":", "_")
+            return backup_dir / f"{safe_key}.jpg"
+        except Exception as err:
+            self._verbose(f"计算海报备份路径失败: {err}")
+            return None
+
+    def _save_poster_backup(self, source_path: Path, backup_path: Path):
+        backup_path.write_bytes(source_path.read_bytes())
+
+    def _poster_variant_urls(self, item) -> List[str]:
+        urls = []
+        seen = set()
+        server = getattr(item, "_server", None)
+        try:
+            posters = item.posters() or []
+        except Exception as err:
+            self._verbose(f"{getattr(item, 'title', 'unknown')} 获取海报候选列表失败: {err}")
+            return urls
+
+        for poster in posters:
+            if getattr(poster, "selected", False):
+                continue
+            key = getattr(poster, "key", "") or ""
+            poster_server = getattr(poster, "_server", None) or server
+            if not key or not poster_server or not hasattr(poster_server, "url"):
+                continue
+            try:
+                try:
+                    url = poster_server.url(key, includeToken=True)
+                except TypeError:
+                    url = poster_server.url(key)
+            except Exception as err:
+                self._verbose(f"{getattr(item, 'title', 'unknown')} 生成候选海报 URL 失败: {err}")
+                continue
+            if url and url not in seen:
+                seen.add(url)
+                urls.append(url)
+        return urls
+
+    def _download_non_overlay_poster(self, url: str, title: str, source_name: str) -> Optional[Path]:
+        try:
+            poster_path = download_poster(url)
+        except Exception as err:
+            self._verbose(f"{title} 下载{source_name}海报失败: {err}")
+            return None
+        if not poster_path:
+            return None
+        if is_overlay_poster(poster_path):
+            self._verbose(f"{title} 的{source_name}海报已带 overlay 标记，跳过")
+            return None
+        return poster_path
+
+    def _source_poster_path(self, item) -> Optional[Path]:
+        title = getattr(item, "title", "unknown")
+        backup_path = self._poster_backup_path(item)
+        current_url = getattr(item, "posterUrl", "") or ""
+
+        if current_url:
+            current_poster = self._download_non_overlay_poster(current_url, title, "当前已选")
+            if current_poster:
+                if backup_path:
+                    try:
+                        self._save_poster_backup(current_poster, backup_path)
+                        self._verbose(f"{title} 使用当前已选未处理海报，并刷新备份: {backup_path}")
+                        return backup_path
+                    except Exception as err:
+                        self._verbose(f"{title} 保存原始海报备份失败，改用临时文件: {err}")
+                self._verbose(f"{title} 使用当前已选未处理海报进行叠加")
+                return current_poster
+            self._verbose(f"{title} 当前已选海报不可直接用于叠加，尝试历史备份或其他候选海报")
+
+        if backup_path and backup_path.exists():
+            if not is_overlay_poster(backup_path):
+                self._verbose(f"{title} 使用历史备份原始海报: {backup_path}")
+                return backup_path
+            self._verbose(f"{title} 的历史备份海报异常带 overlay 标记，忽略该备份")
+
+        for index, poster_url in enumerate(self._poster_variant_urls(item), start=1):
+            candidate = self._download_non_overlay_poster(poster_url, title, f"候选#{index}")
+            if not candidate:
+                continue
+            if backup_path:
+                try:
+                    self._save_poster_backup(candidate, backup_path)
+                    self._verbose(f"{title} 从候选海报恢复原始海报，并保存备份: {backup_path}")
+                    return backup_path
+                except Exception as err:
+                    self._verbose(f"{title} 保存候选海报备份失败，改用临时文件: {err}")
+            self._verbose(f"{title} 使用候选海报作为原始海报进行叠加")
+            return candidate
+
+        logger.warning(f"{title} 未找到未叠加的原始海报，跳过海报叠加")
+        return None
 
     def _safe_media_list(self, item):
         medias = getattr(item, "media", None) or []
