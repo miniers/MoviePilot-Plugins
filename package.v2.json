@@ -1,19 +1,31 @@
 {
-    "PlexPersonMeta": {
-        "name": "Plex演职人员刮削",
-        "description": "实现刮削演职人员中文名称及角色。",
-        "labels": "Plex,刮削",
-        "version": "2.3",
-        "icon": "https://raw.githubusercontent.com/miniers/MoviePilot-Plugins/main/icons/plexpersonmeta.png",
-        "author": "miniers",
-        "level": 1,
-        "history": {
-            "v2.2": "可以设置定时任务只刮削最近入库的媒体",
-            "v2.1": "修复插件启动失败",
-            "v2.0": "兼容MoviePilot的Redis缓存方案，需要MoviePilot v2.2.3+",
-            "v1.9": "修复了入库执行一次失效的问题",
-            "v1.8": "优化执行周期输入，需要MoviePilot v2.2.1+",
-            "v1.7": "MoviePilot V2 版本Plex演职人员刮削插件"
-        }
+  "PlexPersonMeta": {
+    "name": "Plex演职人员刮削",
+    "description": "实现刮削演职人员中文名称及角色。",
+    "labels": "Plex,刮削",
+    "version": "2.3",
+    "icon": "https://raw.githubusercontent.com/miniers/MoviePilot-Plugins/main/icons/plexpersonmeta.png",
+    "author": "miniers",
+    "level": 1,
+    "history": {
+      "v2.2": "可以设置定时任务只刮削最近入库的媒体",
+      "v2.1": "修复插件启动失败",
+      "v2.0": "兼容MoviePilot的Redis缓存方案，需要MoviePilot v2.2.3+",
+      "v1.9": "修复了入库执行一次失效的问题",
+      "v1.8": "优化执行周期输入，需要MoviePilot v2.2.1+",
+      "v1.7": "MoviePilot V2 版本Plex演职人员刮削插件"
     }
+  },
+  "MPPlexTools": {
+    "name": "MP Plex工具箱",
+    "description": "为 MoviePilot V2 提供 Plex 中文本地化、Fanart 封面优选和海报信息叠加。",
+    "labels": "Plex,媒体库,刮削",
+    "version": "0.1.0",
+    "icon": "https://raw.githubusercontent.com/miniers/MoviePilot-Plugins/refs/heads/main/icons/mpplextools.jpg",
+    "author": "miniers",
+    "level": 1,
+    "history": {
+      "v0.1.0": "首个 MoviePilot V2 版本，迁移 Plex 工具箱核心整理能力并移除 Top250。"
+    }
+  }
 }
