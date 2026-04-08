@@ -20,7 +20,7 @@
     "name": "MP Plex工具箱",
     "description": "为 MoviePilot V2 提供 Plex 中文本地化、Fanart 封面优选和海报信息叠加。",
     "labels": "Plex,媒体库,刮削",
-    "version": "0.1.0",
+    "version": "0.1.1",
     "icon": "https://raw.githubusercontent.com/miniers/MoviePilot-Plugins/refs/heads/main/icons/mpplextools.jpg",
     "author": "miniers",
     "level": 1,
