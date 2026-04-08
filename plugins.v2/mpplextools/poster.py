@@ -43,7 +43,10 @@ def _load_badge(asset_root: Path, folder: str, name: str, height: int) -> Option
     candidate = asset_root / "overlays" / "img" / folder / f"{name}.png"
     if not candidate.exists():
         return None
-    image = Image.open(candidate).convert("RGBA")
+    try:
+        image = Image.open(candidate).convert("RGBA")
+    except Exception:
+        return None
     width = int(height * image.width / image.height)
     return image.resize((width, height), Image.LANCZOS)
 

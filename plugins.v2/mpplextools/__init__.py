@@ -403,27 +403,28 @@ class MPPlexTools(_PluginBase):
         }
 
     def get_page(self) -> List[dict]:
-        return [
-            {
-                "component": "VRow",
-                "content": [
-                    {
-                        "component": "VCol",
-                        "props": {"cols": 12},
-                        "content": [
-                            {
-                                "component": "VAlert",
-                                "props": {
-                                    "type": "info",
-                                    "variant": "tonal",
-                                    "text": "功能已适配 MoviePilot V2：支持最近条目/全量整理、合集处理、锁定/解锁模式、标签中文化、拼音排序、Fanart 海报背景优选、入库后整理、海报信息叠加。"
-                                }
+        page_form, _ = self.get_form()
+        header = {
+            "component": "VRow",
+            "content": [
+                {
+                    "component": "VCol",
+                    "props": {"cols": 12},
+                    "content": [
+                        {
+                            "component": "VAlert",
+                            "props": {
+                                "type": "info",
+                                "variant": "tonal",
+                                "text": "首屏直接展示全部配置项：支持最近条目/全量整理、合集处理、锁定/解锁模式、标签中文化、拼音排序、Fanart 海报背景优选、入库后整理、海报信息叠加。"
                             }
-                        ]
-                    }
-                ]
-            }
-        ]
+                        }
+                    ]
+                }
+            ]
+        }
+        return [header] + page_form
+
 
     def stop_service(self):
         try:
