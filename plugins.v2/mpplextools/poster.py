@@ -22,7 +22,7 @@ def _truetype_font(asset_root: Path, name: str, size: int):
 def _ascii_duration_text(duration_text: str) -> str:
     if not duration_text:
         return ""
-    text = duration_text.replace("小时", "h").replace("分钟", "m").replace(" ", "")
+    text = duration_text.replace("时", "H").replace("分", "M").replace(" ", "")
     return text
 
 
@@ -126,9 +126,9 @@ def _normalize_duration(duration_text: str, portrait: bool, resolution: str, dyn
         return duration, 1.198
 
     compact_duration = duration.replace(" ", "")
-    if resolution == "1080P" and "小时" in compact_duration and "分钟" in compact_duration:
+    if resolution == "1080P" and "时" in compact_duration and "分" in compact_duration:
         return compact_duration, 1.192
-    if dynamic_range == "DV" and "小时" in compact_duration and "分钟" in compact_duration:
+    if dynamic_range == "DV" and "时" in compact_duration and "分" in compact_duration:
         return compact_duration, 1.18
     return duration, scale
 
@@ -279,8 +279,8 @@ def _build_reference_overlay(
     # alpha_composite 会返回新图像对象，后续文本必须重新绑定到最终海报上绘制。
     draw = ImageDraw.Draw(poster)
 
-    duration_font_size = int((51 if dynamic_range == "DV" and mode == "movie" else 54) * scale)
-    rating_font_size = int(75 * scale)
+    duration_font_size = int((42 if dynamic_range == "DV" and mode == "movie" else 44) * scale)
+    rating_font_size = int(70 * scale)
     duration_font = _truetype_font(asset_root, "fzlth.ttf", duration_font_size)
     rating_font = _truetype_font(asset_root, "ALIBABA_Bold.otf", rating_font_size)
     if duration_text and not duration_font:

@@ -27,7 +27,7 @@ class MPPlexTools(_PluginBase):
     plugin_name = "MP Plex工具箱"
     plugin_desc = "为 MoviePilot V2 提供 Plex 中文本地化、Fanart 封面优选和海报信息叠加。"
     plugin_icon = "https://github.com/miniers/MoviePilot-Plugins/blob/main/icons/mpplextools.jpg?raw=true"
-    plugin_version = "0.1.5"
+    plugin_version = "0.1.6"
     plugin_author = "miniers"
     author_url = "https://github.com/miniers/MoviePilot-Plugins"
     plugin_config_prefix = "mpplextools_"
@@ -940,8 +940,8 @@ class MPPlexTools(_PluginBase):
         if minutes >= 60:
             hours = minutes // 60
             minutes = minutes % 60
-            return f"{hours}小时{minutes}分钟" if minutes else f"{hours}小时"
-        return f"{minutes}分钟"
+            return f"{hours}时{minutes}分" if minutes else f"{hours}时"
+        return f"{minutes}分"
 
     def _search_item_by_path(self, plex, target_path: str, fallback_title: str = ""):
         search_title = Path(target_path).stem or fallback_title
