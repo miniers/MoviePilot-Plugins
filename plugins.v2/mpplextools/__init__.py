@@ -1,4 +1,3 @@
-import copy
 import json
 import threading
 import time
@@ -28,7 +27,7 @@ class MPPlexTools(_PluginBase):
     plugin_name = "MP Plex工具箱"
     plugin_desc = "为 MoviePilot V2 提供 Plex 中文本地化、Fanart 封面优选和海报信息叠加。"
     plugin_icon = "https://github.com/miniers/MoviePilot-Plugins/blob/main/icons/mpplextools.jpg?raw=true"
-    plugin_version = "0.1.2"
+    plugin_version = "0.1.3"
     plugin_author = "miniers"
     author_url = "https://github.com/miniers/MoviePilot-Plugins"
     plugin_config_prefix = "mpplextools_"
@@ -376,17 +375,7 @@ class MPPlexTools(_PluginBase):
                             {
                                 "component": "VCol",
                                 "props": {"cols": 12},
-                                "content": [{"component": "VAlert", "props": {"type": "info", "variant": "tonal", "text": "当前版本聚焦 Plex 本地化、Fanart、海报叠加和入库后整理。"}}],
-                            }
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12},
-                                "content": [{"component": "VAceEditor", "props": {"model": "custom_tags_json", "lang": "json", "theme": "monokai", "style": "height: 20rem"}}],
+                                "content": [{"component": "VAceEditor", "props": {"modelvalue": "custom_tags_json", "lang": "json", "theme": "monokai", "style": "height: 20rem"}}],
                             }
                         ],
                     },
@@ -417,49 +406,8 @@ class MPPlexTools(_PluginBase):
             "custom_tags_json": self._custom_tags_json or self._preset_tags_json(),
         }
 
-    def _apply_model_values(self, components: List[dict], values: Dict[str, Any]) -> List[dict]:
-        hydrated = copy.deepcopy(components)
-
-        def walk(node: Any):
-            if isinstance(node, list):
-                for item in node:
-                    walk(item)
-                return
-            if not isinstance(node, dict):
-                return
-            props = node.get("props")
-            if isinstance(props, dict):
-                model_key = props.get("model")
-                if model_key in values:
-                    props["modelValue"] = values[model_key]
-            for value in node.values():
-                walk(value)
-
-        walk(hydrated)
-        return hydrated
-
     def get_page(self) -> List[dict]:
-        page_form, data = self.get_form()
-        header = {
-            "component": "VRow",
-            "content": [
-                {
-                    "component": "VCol",
-                    "props": {"cols": 12},
-                    "content": [
-                        {
-                            "component": "VAlert",
-                            "props": {
-                                "type": "info",
-                                "variant": "tonal",
-                                "text": "首屏直接展示全部配置项：支持最近条目/全量整理、合集处理、锁定/解锁模式、标签中文化、拼音排序、Fanart 海报背景优选、入库后整理、海报信息叠加。"
-                            }
-                        }
-                    ]
-                }
-            ]
-        }
-        return [header] + self._apply_model_values(page_form, data)
+        pass
 
 
     def stop_service(self):
