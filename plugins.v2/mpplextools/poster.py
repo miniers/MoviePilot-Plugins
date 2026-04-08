@@ -276,6 +276,9 @@ def _build_reference_overlay(
             draw.text((x_dynamic_range, y_resolution + 7 * scale), dynamic_range_text, fill=(255, 255, 255, 255), font=badge_text_font)
             dynamic_range_badge_width = int(draw.textlength(dynamic_range_text, badge_text_font))
 
+    # alpha_composite 会返回新图像对象，后续文本必须重新绑定到最终海报上绘制。
+    draw = ImageDraw.Draw(poster)
+
     duration_font_size = int((51 if dynamic_range == "DV" and mode == "movie" else 54) * scale)
     rating_font_size = int(75 * scale)
     duration_font = _truetype_font(asset_root, "fzlth.ttf", duration_font_size)
