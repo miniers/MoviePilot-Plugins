@@ -3,7 +3,9 @@ import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote_plus
 
 import pypinyin
 import pytz
@@ -27,7 +29,7 @@ class MPPlexTools(_PluginBase):
     plugin_name = "MP Plex工具箱"
     plugin_desc = "为 MoviePilot V2 提供 Plex 中文本地化、Fanart 封面优选和海报信息叠加。"
     plugin_icon = "https://github.com/miniers/MoviePilot-Plugins/blob/main/icons/mpplextools.jpg?raw=true"
-    plugin_version = "0.1.8"
+    plugin_version = "0.1.9"
     plugin_author = "miniers"
     author_url = "https://github.com/miniers/MoviePilot-Plugins"
     plugin_config_prefix = "mpplextools_"
@@ -57,6 +59,8 @@ class MPPlexTools(_PluginBase):
     _scheduler = None
     _event = threading.Event()
     _last_transfer_at = 0.0
+    _transfer_refresh_retries = 6
+    _transfer_refresh_interval = 10
 
     _default_tags = {
         "Anime": "动画",
@@ -507,14 +511,94 @@ class MPPlexTools(_PluginBase):
 
     def _process_transfer_path(self, target_path: str, title: str):
         time.sleep(max(self._delay, 1))
-        with lock:
-            for service in self._service_infos().values():
-                plex = self._get_plex(service)
-                if not plex:
-                    continue
+        for service in self._service_infos().values():
+            plex = self._get_plex(service)
+            if not plex:
+                continue
+            section = self._match_transfer_section(service, plex, target_path)
+            if not section:
+                logger.warning(f"{self.plugin_name} 未能根据入库路径匹配到媒体库，回退到全局查找: {service.name} - {target_path}")
                 item = self._search_item_by_path(plex, target_path, title)
-                if item:
+            else:
+                self._trigger_partial_refresh(service, plex, section, target_path)
+                item = self._wait_for_transfer_item(service, plex, section, target_path, title)
+            if item:
+                with lock:
                     self._process_item(item, trigger_source="transfer")
+                return
+
+    def _match_transfer_section(self, service: ServiceInfo, plex, target_path: str) -> Optional[LibrarySection]:
+        target = Path(target_path)
+        selected = self._libraries or []
+        for section in plex.library.sections():
+            if section.type == "photo":
+                continue
+            section_key = f"{service.name}:{section.title}"
+            if selected and section.title not in selected and section_key not in selected:
+                continue
+            locations = getattr(section, "locations", []) or []
+            for location in locations:
+                if self._is_subpath(target, Path(str(location))):
+                    return section
+        return None
+
+    def _trigger_partial_refresh(self, service: ServiceInfo, plex, section: LibrarySection, target_path: str) -> bool:
+        target = Path(target_path)
+        instance = getattr(service, "instance", None)
+        refresh_item = SimpleNamespace(target_path=target)
+        if instance and hasattr(instance, "refresh_library_by_items"):
+            try:
+                logger.info(f"{self.plugin_name} 触发 Plex 局部刷新: {service.name}/{section.title} - {target}")
+                instance.refresh_library_by_items([refresh_item])
+                return True
+            except Exception as err:
+                logger.warning(f"{self.plugin_name} 调用宿主局部刷新失败，改用插件内回退: {service.name}/{section.title} - {err}")
+
+        refresh_path = self._refresh_path_from_target(target)
+        try:
+            logger.info(f"{self.plugin_name} 使用回退方式触发 Plex 局部刷新: {service.name}/{section.title} - {refresh_path}")
+            plex.query(f"/library/sections/{section.key}/refresh?path={quote_plus(refresh_path.as_posix())}")
+            return True
+        except Exception as err:
+            logger.warning(f"{self.plugin_name} 触发 Plex 局部刷新失败: {service.name}/{section.title} - {err}")
+            return False
+
+    def _wait_for_transfer_item(
+        self,
+        service: ServiceInfo,
+        plex,
+        section: LibrarySection,
+        target_path: str,
+        title: str,
+    ):
+        attempts = max(self._transfer_refresh_retries, 1)
+        interval = max(self._transfer_refresh_interval, 1)
+        for attempt in range(1, attempts + 1):
+            item = self._search_item_by_path(plex, target_path, title, section=section)
+            if item:
+                if attempt > 1:
+                    logger.info(f"{self.plugin_name} 在第 {attempt} 次重试后命中入库条目: {service.name}/{section.title} - {getattr(item, 'title', title) or title}")
+                return item
+            if attempt < attempts:
+                logger.info(f"{self.plugin_name} 尚未定位到入库条目，等待 Plex 局部刷新完成后重试 ({attempt}/{attempts}): {service.name}/{section.title} - {target_path}")
+                time.sleep(interval)
+        logger.warning(f"{self.plugin_name} 局部刷新后仍未定位到入库条目，跳过本次入库整理: {service.name}/{section.title} - {target_path}")
+        return None
+
+    @staticmethod
+    def _refresh_path_from_target(target_path: Path) -> Path:
+        parent = target_path.parent
+        return parent if parent != target_path else target_path
+
+    @staticmethod
+    def _is_subpath(path: Path, parent: Path) -> bool:
+        try:
+            target = path.resolve(strict=False)
+            base = parent.resolve(strict=False)
+        except Exception:
+            target = path
+            base = parent
+        return target.parts[:len(base.parts)] == base.parts
 
     def _service_infos(self) -> Dict[str, ServiceInfo]:
         services = self.mediaserver_helper.get_services(name_filters=self._mediaservers, type_filter="plex")
@@ -1019,20 +1103,49 @@ class MPPlexTools(_PluginBase):
             return f"{hours}时{minutes}分" if minutes else f"{hours}时"
         return f"{minutes}分"
 
-    def _search_item_by_path(self, plex, target_path: str, fallback_title: str = ""):
-        search_title = Path(target_path).stem or fallback_title
-        results = plex.library.search(search_title) if search_title else []
+    def _search_item_by_path(
+        self,
+        plex,
+        target_path: str,
+        fallback_title: str = "",
+        section: Optional[LibrarySection] = None,
+    ):
+        target = Path(target_path)
         target_norm = target_path.replace("\\", "/")
-        for item in results:
-            locations = [str(path).replace("\\", "/") for path in getattr(item, "locations", []) or []]
-            media_parts = []
-            for media in getattr(item, "media", []) or []:
-                for part in getattr(media, "parts", []) or []:
-                    media_parts.append(str(getattr(part, "file", "")).replace("\\", "/"))
-            all_paths = locations + media_parts
-            if any(target_norm in path or path in target_norm for path in all_paths):
-                return item
-        return results[0] if results else None
+        search_terms: List[str] = []
+        for raw in [fallback_title, target.stem, target.name, target.parent.name]:
+            value = str(raw or "").strip()
+            if not value:
+                continue
+            for candidate in [value, value.replace(".", " ")]:
+                candidate = candidate.strip()
+                if candidate and candidate not in search_terms:
+                    search_terms.append(candidate)
+
+        fallback_item = None
+        section_key = str(getattr(section, "key", "")) if section else ""
+        for search_term in search_terms:
+            try:
+                results = plex.library.search(search_term)
+            except Exception as err:
+                self._verbose(f"搜索入库条目失败: 关键词={search_term} 错误={err}")
+                continue
+            filtered = []
+            for item in results:
+                if section_key and str(getattr(item, "librarySectionID", "")) != section_key:
+                    continue
+                filtered.append(item)
+                locations = [str(path).replace("\\", "/") for path in getattr(item, "locations", []) or []]
+                media_parts = []
+                for media in getattr(item, "media", []) or []:
+                    for part in getattr(media, "parts", []) or []:
+                        media_parts.append(str(getattr(part, "file", "")).replace("\\", "/"))
+                all_paths = locations + media_parts
+                if any(target_norm in path or path in target_norm for path in all_paths):
+                    return item
+            if not fallback_item and len(filtered) == 1:
+                fallback_item = filtered[0]
+        return fallback_item
 
     def _locked_fields(self, item) -> List[str]:
         fields = []
