@@ -27,7 +27,7 @@ class MPPlexTools(_PluginBase):
     plugin_name = "MP Plex工具箱"
     plugin_desc = "为 MoviePilot V2 提供 Plex 中文本地化、Fanart 封面优选和海报信息叠加。"
     plugin_icon = "https://github.com/miniers/MoviePilot-Plugins/blob/main/icons/mpplextools.jpg?raw=true"
-    plugin_version = "0.1.7"
+    plugin_version = "0.1.8"
     plugin_author = "miniers"
     author_url = "https://github.com/miniers/MoviePilot-Plugins"
     plugin_config_prefix = "mpplextools_"
@@ -140,6 +140,7 @@ class MPPlexTools(_PluginBase):
                 func=self.run_full_scan,
                 trigger="date",
                 run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
+                kwargs={"trigger_source": "onlyonce", "ignore_overlay_marker": True},
                 name=self.plugin_name,
             )
             self._onlyonce = False
@@ -202,7 +203,7 @@ class MPPlexTools(_PluginBase):
                 "name": self.plugin_name,
                 "trigger": CronTrigger.from_crontab(self._cron),
                 "func": self.run_full_scan,
-                "kwargs": {},
+                "kwargs": {"trigger_source": "schedule"},
             }]
         return []
 
@@ -429,7 +430,7 @@ class MPPlexTools(_PluginBase):
         run_mode = payload.get("run_mode") if isinstance(payload, dict) else None
         collection = payload.get("collection") if isinstance(payload, dict) else None
         recent_only = mode != "full"
-        kwargs = {"libraries": libraries, "recent_only": recent_only}
+        kwargs = {"libraries": libraries, "recent_only": recent_only, "trigger_source": "api"}
         if run_mode:
             kwargs["run_mode"] = run_mode
         if collection is not None:
@@ -443,7 +444,7 @@ class MPPlexTools(_PluginBase):
             return
         if event.event_data.get("action") != "mp_plex_tools_run":
             return
-        threading.Thread(target=self.run_full_scan, kwargs={"recent_only": True}, daemon=True).start()
+        threading.Thread(target=self.run_full_scan, kwargs={"recent_only": True, "trigger_source": "command"}, daemon=True).start()
 
     @eventmanager.register(EventType.TransferComplete)
     def handle_transfer(self, event: Event = None):
@@ -474,6 +475,8 @@ class MPPlexTools(_PluginBase):
         recent_only: bool = True,
         run_mode: Optional[str] = None,
         collection: Optional[bool] = None,
+        ignore_overlay_marker: bool = False,
+        trigger_source: str = "manual",
     ):
         if not self._enabled and not libraries and event is None:
             return
@@ -486,7 +489,14 @@ class MPPlexTools(_PluginBase):
                 if not plex:
                     continue
                 for section in self._iter_sections(service, plex, libraries):
-                    total += self._process_section(section, recent_only=recent_only, run_mode=current_run_mode, collection=current_collection)
+                    total += self._process_section(
+                        section,
+                        recent_only=recent_only,
+                        run_mode=current_run_mode,
+                        collection=current_collection,
+                        ignore_overlay_marker=ignore_overlay_marker,
+                        trigger_source=trigger_source,
+                    )
             if self._notify:
                 scope = "最近条目" if recent_only else "全量媒体库"
                 self.post_message(
@@ -504,7 +514,7 @@ class MPPlexTools(_PluginBase):
                     continue
                 item = self._search_item_by_path(plex, target_path, title)
                 if item:
-                    self._process_item(item)
+                    self._process_item(item, trigger_source="transfer")
 
     def _service_infos(self) -> Dict[str, ServiceInfo]:
         services = self.mediaserver_helper.get_services(name_filters=self._mediaservers, type_filter="plex")
@@ -550,10 +560,24 @@ class MPPlexTools(_PluginBase):
                 continue
             yield section
 
-    def _process_section(self, section: LibrarySection, recent_only: bool = True, run_mode: str = "run_all", collection: bool = False) -> int:
+    def _process_section(
+        self,
+        section: LibrarySection,
+        recent_only: bool = True,
+        run_mode: str = "run_all",
+        collection: bool = False,
+        ignore_overlay_marker: bool = False,
+        trigger_source: str = "manual",
+    ) -> int:
         count = 0
         if collection:
-            count += self._process_collections(section, recent_only=recent_only, run_mode=run_mode)
+            count += self._process_collections(
+                section,
+                recent_only=recent_only,
+                run_mode=run_mode,
+                ignore_overlay_marker=ignore_overlay_marker,
+                trigger_source=trigger_source,
+            )
         items = section.all()
         items.sort(key=lambda item: getattr(item, "addedAt", datetime.min), reverse=True)
         limit = max(self._recent_limit, 1) if recent_only else self._batch_size
@@ -562,13 +586,25 @@ class MPPlexTools(_PluginBase):
             if self._event.is_set():
                 return count
             try:
-                self._process_item(item, run_mode=run_mode)
+                self._process_item(
+                    item,
+                    run_mode=run_mode,
+                    ignore_overlay_marker=ignore_overlay_marker,
+                    trigger_source=trigger_source,
+                )
                 count += 1
             except Exception as err:
                 logger.error(f"处理 {section.title}/{getattr(item, 'title', 'unknown')} 失败: {err}")
         return count
 
-    def _process_collections(self, section: LibrarySection, recent_only: bool = True, run_mode: str = "run_all") -> int:
+    def _process_collections(
+        self,
+        section: LibrarySection,
+        recent_only: bool = True,
+        run_mode: str = "run_all",
+        ignore_overlay_marker: bool = False,
+        trigger_source: str = "manual",
+    ) -> int:
         count = 0
         try:
             collections = section.collections() or []
@@ -579,20 +615,31 @@ class MPPlexTools(_PluginBase):
         target_items = collections[:limit]
         for collection in target_items:
             try:
-                self._process_item(collection, run_mode=run_mode)
+                self._process_item(
+                    collection,
+                    run_mode=run_mode,
+                    ignore_overlay_marker=ignore_overlay_marker,
+                    trigger_source=trigger_source,
+                )
                 count += 1
             except Exception as err:
                 logger.error(f"处理合集 {section.title}/{getattr(collection, 'title', 'unknown')} 失败: {err}")
         return count
 
-    def _process_item(self, item, run_mode: str = "run_all"):
+    def _process_item(
+        self,
+        item,
+        run_mode: str = "run_all",
+        ignore_overlay_marker: bool = False,
+        trigger_source: str = "manual",
+    ):
         if run_mode == "run_locked":
             self._lock_item_images(item)
-            self._process_related_children(item, run_mode=run_mode)
+            self._process_related_children(item, run_mode=run_mode, trigger_source=trigger_source)
             return
         if run_mode == "run_unlocked":
             self._unlock_item_images(item)
-            self._process_related_children(item, run_mode=run_mode)
+            self._process_related_children(item, run_mode=run_mode, trigger_source=trigger_source)
             return
         if self._fanart:
             self._apply_fanart(item)
@@ -601,8 +648,13 @@ class MPPlexTools(_PluginBase):
         if self._sort_title:
             self._update_sort_title(item)
         if self._overlay_poster:
-            self._overlay_item_poster(item)
-        self._process_related_children(item, run_mode=run_mode)
+            self._overlay_item_poster(item, ignore_overlay_marker=ignore_overlay_marker, trigger_source=trigger_source)
+        self._process_related_children(
+            item,
+            run_mode=run_mode,
+            ignore_overlay_marker=ignore_overlay_marker,
+            trigger_source=trigger_source,
+        )
 
     def _lock_item_images(self, item):
         try:
@@ -622,7 +674,13 @@ class MPPlexTools(_PluginBase):
         except Exception as err:
             logger.debug(f"解锁海报背景失败: {err}")
 
-    def _process_related_children(self, item, run_mode: str = "run_all"):
+    def _process_related_children(
+        self,
+        item,
+        run_mode: str = "run_all",
+        ignore_overlay_marker: bool = False,
+        trigger_source: str = "manual",
+    ):
         item_type = getattr(item, "type", "")
         if run_mode in {"run_locked", "run_unlocked"}:
             targets = []
@@ -644,15 +702,15 @@ class MPPlexTools(_PluginBase):
             return
         try:
             if item_type == "show":
-                self._overlay_item_poster(item)
+                self._overlay_item_poster(item, ignore_overlay_marker=ignore_overlay_marker, trigger_source=trigger_source)
                 for season in item.seasons() or []:
-                    self._overlay_item_poster(season)
+                    self._overlay_item_poster(season, ignore_overlay_marker=ignore_overlay_marker, trigger_source=trigger_source)
                     for episode in season.episodes() or []:
-                        self._overlay_item_poster(episode)
+                        self._overlay_item_poster(episode, ignore_overlay_marker=ignore_overlay_marker, trigger_source=trigger_source)
             elif item_type == "season":
-                self._overlay_item_poster(item)
+                self._overlay_item_poster(item, ignore_overlay_marker=ignore_overlay_marker, trigger_source=trigger_source)
                 for episode in item.episodes() or []:
-                    self._overlay_item_poster(episode)
+                    self._overlay_item_poster(episode, ignore_overlay_marker=ignore_overlay_marker, trigger_source=trigger_source)
         except Exception as err:
             logger.debug(f"处理关联海报失败: {err}")
 
@@ -705,11 +763,22 @@ class MPPlexTools(_PluginBase):
             item.editSortTitle(sort_title)
 
 
-    def _overlay_item_poster(self, item):
+    @staticmethod
+    def _trigger_source_label(trigger_source: str) -> str:
+        return {
+            "onlyonce": "立即运行一次",
+            "schedule": "定时任务",
+            "api": "API 调用",
+            "command": "插件命令",
+            "transfer": "入库事件",
+            "manual": "手动任务",
+        }.get(trigger_source, "当前任务")
+
+    def _overlay_item_poster(self, item, ignore_overlay_marker: bool = False, trigger_source: str = "manual"):
         item_type = getattr(item, "type", "")
         if item_type not in {"movie", "show", "season", "episode"}:
             return
-        poster_path = self._source_poster_path(item)
+        poster_path = self._source_poster_path(item, ignore_overlay_marker=ignore_overlay_marker, trigger_source=trigger_source)
         if not poster_path:
             return
         resolution, dynamic_range, duration_text, rating_text = self._media_overlay_info(item)
@@ -786,26 +855,26 @@ class MPPlexTools(_PluginBase):
                 urls.append(url)
         return urls
 
-    def _download_non_overlay_poster(self, url: str, title: str, source_name: str) -> Optional[Path]:
+    def _download_non_overlay_poster(self, url: str, title: str, source_name: str) -> Tuple[Optional[Path], bool]:
         try:
             poster_path = download_poster(url)
         except Exception as err:
             self._verbose(f"{title} 下载{source_name}海报失败: {err}")
-            return None
+            return None, False
         if not poster_path:
-            return None
+            return None, False
         if is_overlay_poster(poster_path):
             self._verbose(f"{title} 的{source_name}海报已带 overlay 标记，跳过")
-            return None
-        return poster_path
+            return None, True
+        return poster_path, False
 
-    def _source_poster_path(self, item) -> Optional[Path]:
+    def _source_poster_path(self, item, ignore_overlay_marker: bool = False, trigger_source: str = "manual") -> Optional[Path]:
         title = getattr(item, "title", "unknown")
         backup_path = self._poster_backup_path(item)
         current_url = getattr(item, "posterUrl", "") or ""
 
         if current_url:
-            current_poster = self._download_non_overlay_poster(current_url, title, "当前已选")
+            current_poster, current_has_overlay = self._download_non_overlay_poster(current_url, title, "当前已选")
             if current_poster:
                 if backup_path:
                     try:
@@ -816,6 +885,13 @@ class MPPlexTools(_PluginBase):
                         self._verbose(f"{title} 保存原始海报备份失败，改用临时文件: {err}")
                 self._verbose(f"{title} 使用当前已选未处理海报进行叠加")
                 return current_poster
+            if current_has_overlay:
+                source_label = self._trigger_source_label(trigger_source)
+                if ignore_overlay_marker:
+                    self._verbose(f"{title} 当前已选海报已带 overlay 标记，但本次执行来源为{source_label}，允许忽略并继续尝试历史备份或其他候选海报")
+                else:
+                    self._verbose(f"{title} 当前已选海报已带 overlay 标记，本次执行来源为{source_label}，跳过本次海报叠加")
+                    return None
             self._verbose(f"{title} 当前已选海报不可直接用于叠加，尝试历史备份或其他候选海报")
 
         if backup_path and backup_path.exists():
@@ -825,7 +901,7 @@ class MPPlexTools(_PluginBase):
             self._verbose(f"{title} 的历史备份海报异常带 overlay 标记，忽略该备份")
 
         for index, poster_url in enumerate(self._poster_variant_urls(item), start=1):
-            candidate = self._download_non_overlay_poster(poster_url, title, f"候选#{index}")
+            candidate, _ = self._download_non_overlay_poster(poster_url, title, f"候选#{index}")
             if not candidate:
                 continue
             if backup_path:
