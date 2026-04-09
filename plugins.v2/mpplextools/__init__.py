@@ -29,7 +29,7 @@ class MPPlexTools(_PluginBase):
     plugin_name = "MP Plex工具箱"
     plugin_desc = "为 MoviePilot V2 提供 Plex 中文本地化、Fanart 封面优选和海报信息叠加。"
     plugin_icon = "https://github.com/miniers/MoviePilot-Plugins/blob/main/icons/mpplextools.jpg?raw=true"
-    plugin_version = "0.1.9"
+    plugin_version = "0.1.10"
     plugin_author = "miniers"
     author_url = "https://github.com/miniers/MoviePilot-Plugins"
     plugin_config_prefix = "mpplextools_"
@@ -515,13 +515,9 @@ class MPPlexTools(_PluginBase):
             plex = self._get_plex(service)
             if not plex:
                 continue
+            self._trigger_partial_refresh(service, plex, None, target_path)
             section = self._match_transfer_section(service, plex, target_path)
-            if not section:
-                logger.warning(f"{self.plugin_name} 未能根据入库路径匹配到媒体库，回退到全局查找: {service.name} - {target_path}")
-                item = self._search_item_by_path(plex, target_path, title)
-            else:
-                self._trigger_partial_refresh(service, plex, section, target_path)
-                item = self._wait_for_transfer_item(service, plex, section, target_path, title)
+            item = self._wait_for_transfer_item(service, plex, section, target_path, title)
             if item:
                 with lock:
                     self._process_item(item, trigger_source="transfer")
@@ -529,12 +525,8 @@ class MPPlexTools(_PluginBase):
 
     def _match_transfer_section(self, service: ServiceInfo, plex, target_path: str) -> Optional[LibrarySection]:
         target = Path(target_path)
-        selected = self._libraries or []
         for section in plex.library.sections():
             if section.type == "photo":
-                continue
-            section_key = f"{service.name}:{section.title}"
-            if selected and section.title not in selected and section_key not in selected:
                 continue
             locations = getattr(section, "locations", []) or []
             for location in locations:
@@ -542,17 +534,27 @@ class MPPlexTools(_PluginBase):
                     return section
         return None
 
-    def _trigger_partial_refresh(self, service: ServiceInfo, plex, section: LibrarySection, target_path: str) -> bool:
+    def _trigger_partial_refresh(
+        self,
+        service: ServiceInfo,
+        plex,
+        section: Optional[LibrarySection],
+        target_path: str,
+    ) -> bool:
         target = Path(target_path)
         instance = getattr(service, "instance", None)
         refresh_item = SimpleNamespace(target_path=target)
         if instance and hasattr(instance, "refresh_library_by_items"):
             try:
-                logger.info(f"{self.plugin_name} 触发 Plex 局部刷新: {service.name}/{section.title} - {target}")
+                logger.info(f"{self.plugin_name} 触发 Plex 局部刷新: {service.name} - {target}")
                 instance.refresh_library_by_items([refresh_item])
                 return True
             except Exception as err:
-                logger.warning(f"{self.plugin_name} 调用宿主局部刷新失败，改用插件内回退: {service.name}/{section.title} - {err}")
+                logger.warning(f"{self.plugin_name} 调用宿主局部刷新失败，改用插件内回退: {service.name} - {err}")
+
+        if not section:
+            logger.warning(f"{self.plugin_name} 未能根据入库路径匹配到媒体库，无法使用插件内局部刷新回退: {service.name} - {target_path}")
+            return False
 
         refresh_path = self._refresh_path_from_target(target)
         try:
@@ -567,7 +569,7 @@ class MPPlexTools(_PluginBase):
         self,
         service: ServiceInfo,
         plex,
-        section: LibrarySection,
+        section: Optional[LibrarySection],
         target_path: str,
         title: str,
     ):
@@ -577,12 +579,15 @@ class MPPlexTools(_PluginBase):
             item = self._search_item_by_path(plex, target_path, title, section=section)
             if item:
                 if attempt > 1:
-                    logger.info(f"{self.plugin_name} 在第 {attempt} 次重试后命中入库条目: {service.name}/{section.title} - {getattr(item, 'title', title) or title}")
+                    scope = f"{service.name}/{section.title}" if section else service.name
+                    logger.info(f"{self.plugin_name} 在第 {attempt} 次重试后命中入库条目: {scope} - {getattr(item, 'title', title) or title}")
                 return item
             if attempt < attempts:
-                logger.info(f"{self.plugin_name} 尚未定位到入库条目，等待 Plex 局部刷新完成后重试 ({attempt}/{attempts}): {service.name}/{section.title} - {target_path}")
+                scope = f"{service.name}/{section.title}" if section else service.name
+                logger.info(f"{self.plugin_name} 尚未定位到入库条目，等待 Plex 局部刷新完成后重试 ({attempt}/{attempts}): {scope} - {target_path}")
                 time.sleep(interval)
-        logger.warning(f"{self.plugin_name} 局部刷新后仍未定位到入库条目，跳过本次入库整理: {service.name}/{section.title} - {target_path}")
+        scope = f"{service.name}/{section.title}" if section else service.name
+        logger.warning(f"{self.plugin_name} 局部刷新后仍未定位到入库条目，跳过本次入库整理: {scope} - {target_path}")
         return None
 
     @staticmethod
