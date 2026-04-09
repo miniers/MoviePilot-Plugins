@@ -133,6 +133,18 @@ def _normalize_duration(duration_text: str, portrait: bool, resolution: str, dyn
     return duration, scale
 
 
+def _center_text_y(draw, text: str, font, box_top: int, box_height: int, fallback_height: int = 0) -> int:
+    if not text or not font:
+        return int(box_top + (box_height - fallback_height) / 2)
+    try:
+        _, text_top, _, text_bottom = draw.textbbox((0, 0), text, font=font)
+        text_height = text_bottom - text_top
+        return int(box_top + (box_height - text_height) / 2 - text_top)
+    except Exception:
+        text_height = fallback_height or getattr(font, "size", 0)
+        return int(box_top + (box_height - text_height) / 2)
+
+
 def _build_reference_overlay(
     poster_path: Path,
     asset_root: Path,
@@ -293,22 +305,16 @@ def _build_reference_overlay(
         if debug_log:
             debug_log("评分字体加载失败，已回退为默认字体")
 
-    duration_width = int(draw.textlength(duration_text, duration_font)) if duration_text and duration_font else 0
     rating_width = int(draw.textlength(rating_text, rating_font)) if rating_text and rating_font else 0
-    text_height = 52 * scale
+    rating_anchor_height = 52 * scale
 
-    y_duration = int(y + bar_height / 2 - text_height / 2)
-    if mode == "movie":
-        x_duration = int(x_resolution + resolution_badge_width + 20 * scale + dynamic_range_badge_width + 22 * scale)
-    else:
-        x_duration = int(x_resolution + resolution_badge_width + 20 * scale + dynamic_range_badge_width + 30 * scale)
-    y_rating = int(y + bar_height / 2 - text_height / 2)
+    duration_gap = (22 if mode == "movie" else 30) + (8 if dynamic_range_badge_width else 0)
+    x_duration = int(x_dynamic_range + dynamic_range_badge_width + duration_gap * scale)
+    y_duration = _center_text_y(draw, duration_text, duration_font, y, bar_height, fallback_height=int(rating_anchor_height))
+    y_rating = int(y + bar_height / 2 - rating_anchor_height / 2)
 
     if duration_text and duration_font:
-        if mode == "movie":
-            draw.text((x_duration, y_duration - 3 * scale), duration_text, fill=(255, 255, 255, 255), font=duration_font)
-        else:
-            draw.text((x_duration, y_duration - 5 * scale + 1), duration_text, fill=(255, 255, 255, 255), font=duration_font)
+        draw.text((x_duration, y_duration), duration_text, fill=(255, 255, 255, 255), font=duration_font)
 
     if rating_text and rating_font:
         if mode == "movie":
