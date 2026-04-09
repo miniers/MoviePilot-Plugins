@@ -5,8 +5,10 @@ helper.py
 """
 import functools
 import hashlib
+import json
 from dataclasses import dataclass
-from typing import Optional
+from pathlib import Path
+from typing import Any, Optional
 
 from app.core.cache import Cache
 from app.log import logger
@@ -25,6 +27,28 @@ def clear_cache_regions():
         backend.clear(region="plex_tmdb_media")
         backend.clear(region="plex_tmdb_person")
         backend.clear(region="plex_douban_media")
+
+
+def sanitize_filename(value: str) -> str:
+    """将任意文本转换为稳定的文件名片段。"""
+    return str(value or "unknown").strip().replace("/", "_").replace(":", "_").replace(" ", "_")
+
+
+def write_json_file(path: Path, payload: Any):
+    """写入 JSON 文件，并确保父目录存在。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def read_json_file(path: Path) -> Any:
+    """读取 JSON 文件；不存在或读取失败时返回 None。"""
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as err:
+        logger.error(f"读取 JSON 文件失败: {path} - {err}")
+        return None
 
 
 @dataclass

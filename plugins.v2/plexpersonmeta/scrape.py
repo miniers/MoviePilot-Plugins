@@ -2,6 +2,8 @@ import copy
 import re
 import threading
 import time
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import plexapi
@@ -15,7 +17,13 @@ from app.chain.tmdb import TmdbChain
 from app.core.context import MediaInfo
 from app.log import logger
 from app.plugins import PluginChian
-from app.plugins.plexpersonmeta.helper import RatingInfo, cache_with_logging, clear_cache_regions
+from app.plugins.plexpersonmeta.helper import (
+    RatingInfo,
+    cache_with_logging,
+    clear_cache_regions,
+    sanitize_filename,
+    write_json_file,
+)
 from app.schemas import MediaPerson, ServiceInfo
 from app.schemas.types import MediaType
 from app.utils.string import StringUtils
@@ -27,7 +35,8 @@ class ScrapeHelper:
     timeout: int = 10
 
     def __init__(self, config: dict, event: threading.Event, chain: PluginChian,
-                 service: ServiceInfo, libraries: dict[int, Any]):
+                 service: ServiceInfo, libraries: dict[int, Any], data_dir: Optional[str] = None,
+                 dry_run: bool = False, backup_enabled: bool = True, backup_batch_id: Optional[str] = None):
         self.tmdb_chain = TmdbChain()
         self.mediaserver_chain = MediaServerChain()
         self.chain = chain
@@ -48,47 +57,180 @@ class ScrapeHelper:
             self._delay = int(config.get("delay", 200))
         except ValueError:
             self._delay = 200
+        self._dry_run = bool(dry_run)
+        self._backup_enabled = bool(backup_enabled)
+        self._backup_batch_id = backup_batch_id or datetime.now().strftime("%Y%m%d%H%M%S")
+        self._data_dir = Path(data_dir) if data_dir else Path("/tmp") / "plexpersonmeta"
+        self._backup_records: List[Dict[str, Any]] = []
+
+    @staticmethod
+    def _new_stats() -> Dict[str, Any]:
+        return {
+            "processed": 0,
+            "changed": 0,
+            "skipped": 0,
+            "errors": 0,
+            "backed_up": 0,
+            "items": [],
+            "skip_reasons": [],
+        }
+
+    @staticmethod
+    def _merge_stats(target: Dict[str, Any], delta: Dict[str, Any]):
+        if not delta:
+            return target
+        for key in ["processed", "changed", "skipped", "errors", "backed_up"]:
+            target[key] += int(delta.get(key, 0) or 0)
+        target["items"].extend(delta.get("items", []) or [])
+        target["skip_reasons"].extend(delta.get("skip_reasons", []) or [])
+        target["skip_reasons"] = target["skip_reasons"][-50:]
+        return target
+
+    @staticmethod
+    def _record_skip(stats: Dict[str, Any], title: str, stage: str, reason: str):
+        stats["skipped"] += 1
+        stats["skip_reasons"].append({
+            "title": title or "unknown",
+            "stage": stage,
+            "reason": reason,
+        })
+
+    @staticmethod
+    def _record_error(stats: Dict[str, Any], title: str, stage: str, reason: str):
+        stats["errors"] += 1
+        stats["skip_reasons"].append({
+            "title": title or "unknown",
+            "stage": stage,
+            "reason": reason,
+        })
+
+    @staticmethod
+    def _actor_payload(actor: dict) -> Dict[str, str]:
+        return {
+            "tag": actor.get("tag", "") or "",
+            "role": actor.get("role", "") or "",
+            "thumb": actor.get("thumb", "") or "",
+            "tagKey": actor.get("tagKey", "") or "",
+        }
+
+    def _summarize_changes(self, before_actors: List[dict], after_actors: List[dict]) -> List[str]:
+        changes: List[str] = []
+        total = max(len(before_actors), len(after_actors))
+        for index in range(total):
+            before = before_actors[index] if index < len(before_actors) else {}
+            after = after_actors[index] if index < len(after_actors) else {}
+            before_name = before.get("tag") or f"演员#{index + 1}"
+            after_name = after.get("tag") or before_name
+            if before.get("tag", "") != after.get("tag", ""):
+                changes.append(f"演员名: {before_name} -> {after_name}")
+            if before.get("role", "") != after.get("role", ""):
+                changes.append(
+                    f"角色: {after_name} {before.get('role', '') or '-'} -> {after.get('role', '') or '-'}"
+                )
+        return changes
+
+    def _detail_from_plan(self, title: str, changes: List[str]) -> str:
+        preview = "；".join(changes[:4]) if changes else "无差异"
+        if len(changes) > 4:
+            preview = f"{preview}；其余 {len(changes) - 4} 项省略"
+        prefix = "预演" if self._dry_run else "写回"
+        return f"[{prefix}] {title}: {preview}"
+
+    def _backup_file_path(self, rating_key: str, title: str) -> Path:
+        filename = f"{sanitize_filename(rating_key)}_{sanitize_filename(title)}.json"
+        return self._data_dir / "actor_backups" / self._backup_batch_id / filename
+
+    def _backup_actor_state(self, item: dict, info: Optional[RatingInfo], actors: List[dict]) -> Optional[Dict[str, Any]]:
+        rating_key = item.get("ratingKey")
+        title = info.title if info and info.title else item.get("title") or rating_key
+        if not rating_key or not actors:
+            return None
+
+        path = self._backup_file_path(str(rating_key), str(title))
+        payload = {
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "service_name": getattr(self.service, "name", "") if self.service else "",
+            "rating_key": str(rating_key),
+            "title": str(title),
+            "item_type": item.get("type", ""),
+            "actors": [self._actor_payload(actor) for actor in actors],
+        }
+        write_json_file(path, payload)
+
+        record = {
+            "service_name": payload["service_name"],
+            "rating_key": payload["rating_key"],
+            "title": payload["title"],
+            "item_type": payload["item_type"],
+            "created_at": payload["created_at"],
+            "backup_path": path.as_posix(),
+        }
+        self._backup_records.append(record)
+        return record
+
+    def backup_records(self) -> List[Dict[str, Any]]:
+        return copy.deepcopy(self._backup_records)
 
     def scrape_rating_items(self, rating_items: list):
         """刮削媒体库中的媒体项"""
+        stats = self._new_stats()
         for rating_item in rating_items:
             if self.check_external_interrupt():
-                return
+                return stats
             info = self.get_rating_info(item=rating_item)
             if not info or info.type not in ["movie", "show"]:
+                self._record_skip(stats, getattr(info, "title", "unknown") if info else "unknown", "rating", "不支持的媒体类型")
                 continue
             item = {}
             try:
                 item = self.fetch_item(rating_key=info.key)
                 if not item:
+                    self._record_skip(stats, info.title, "fetch", "未获取到媒体详情")
                     continue
                 logger.info(f"开始刮削 {info.title} 的演员信息 ...")
-                self.scrape_item(item=item)
-                logger.info(f"{info.title} 的演员信息刮削完成")
+                outcome = self.scrape_item(item=item, info=info)
+                stats["processed"] += 1
+                if outcome.get("status") == "changed":
+                    stats["changed"] += 1
+                    if outcome.get("detail"):
+                        stats["items"].append(outcome["detail"])
+                    if outcome.get("backup_created"):
+                        stats["backed_up"] += 1
+                    logger.info(f"{info.title} 的演员信息刮削完成")
+                elif outcome.get("status") == "skipped":
+                    self._record_skip(stats, info.title, outcome.get("stage", "scrape"), outcome.get("reason", "未产生变更"))
+                elif outcome.get("status") == "error":
+                    self._record_error(stats, info.title, outcome.get("stage", "scrape"), outcome.get("reason", "未知错误"))
             except Exception as e:
                 logger.error(f"媒体项 {info.title} 刮削过程中出现异常，{str(e)}")
+                self._record_error(stats, info.title, "scrape", str(e))
 
             if info.type != "show":
                 logger.info(f"<{info.title}> 类型为 {info.type}，非show类型，跳过剧集刮削")
                 continue
             logger.info(f"<{info.title}> 类型为 show，准备进行剧集刮削")
-            self.scrape_episodes(item=item)
+            self._merge_stats(stats, self.scrape_episodes(item=item))
+        return stats
 
     def scrape_episode_items(self, episode_items: dict):
         """刮削剧集的媒体信息"""
+        stats = self._new_stats()
         for parent_key, episodes in episode_items.items():
             if self.check_external_interrupt():
-                return
+                return stats
             item = self.fetch_item(rating_key=parent_key)
             if not item:
+                self._record_skip(stats, parent_key, "episode", "未获取到父级剧集详情")
                 continue
-            self.scrape_episodes(item=item, episodes=episodes)
+            self._merge_stats(stats, self.scrape_episodes(item=item, episodes=episodes))
+        return stats
 
     def scrape_episodes(self, item: dict, episodes: Optional[dict] = None):
         """刮削剧集"""
+        stats = self._new_stats()
         info = self.get_rating_info(item=item)
         if not info or info.type != "show":
-            return
+            return stats
 
         try:
             # 如果 episodes 为空，这里获取所有的 episodes 进行刮削
@@ -107,35 +249,51 @@ class ScrapeHelper:
 
             for episode in episodes:
                 if self.check_external_interrupt():
-                    return
+                    return stats
                 episode_info = self.get_rating_info(item=episode, parent_item=item)
                 if not episode_info or episode_info.type != "episode":
+                    self._record_skip(stats, getattr(episode_info, "title", "unknown") if episode_info else "unknown", "episode", "无效的剧集条目")
                     continue
                 try:
                     episode_item = self.fetch_item(rating_key=episode_info.key)
                     if not episode_item:
+                        self._record_skip(stats, episode_info.title, "fetch-episode", "未获取到剧集详情")
                         continue
                     logger.info(f"开始刮削 {episode_info.title} 的演员信息 ...")
-                    self.scrape_item(item=episode_item, info=episode_info)
-                    logger.info(f"{episode_info.title} 的演员信息刮削完成")
+                    outcome = self.scrape_item(item=episode_item, info=episode_info)
+                    stats["processed"] += 1
+                    if outcome.get("status") == "changed":
+                        stats["changed"] += 1
+                        if outcome.get("detail"):
+                            stats["items"].append(outcome["detail"])
+                        if outcome.get("backup_created"):
+                            stats["backed_up"] += 1
+                        logger.info(f"{episode_info.title} 的演员信息刮削完成")
+                    elif outcome.get("status") == "skipped":
+                        self._record_skip(stats, episode_info.title, outcome.get("stage", "episode"), outcome.get("reason", "未产生变更"))
+                    elif outcome.get("status") == "error":
+                        self._record_error(stats, episode_info.title, outcome.get("stage", "episode"), outcome.get("reason", "未知错误"))
                 except Exception as e:
                     logger.error(f"媒体项 {episode_info.title} 刮削过程中出现异常，{str(e)}")
+                    self._record_error(stats, episode_info.title, "episode", str(e))
         except Exception as e:
             logger.error(f"媒体项 {info.title} 刮削剧集过程中出现异常，{str(e)}")
+            self._record_error(stats, info.title, "episodes", str(e))
+        return stats
 
     def scrape_item(self, item: dict, info: Optional[RatingInfo] = None):
         """
         刮削媒体服务器中的条目
         """
         if not item:
-            return
+            return {"status": "skipped", "stage": "item", "reason": "条目为空"}
 
         if not info:
             info = self.get_rating_info(item=item)
 
         if not info or not info.tmdbid:
             logger.warning(f"{info.title} 未找到tmdbid，无法识别媒体信息")
-            return
+            return {"status": "skipped", "stage": "tmdb", "reason": "未找到 tmdbid"}
 
         logger.info(f"{info.title} 正在获取 TMDB 媒体信息")
         mediainfo = self.get_tmdb_media(tmdbid=info.tmdbid,
@@ -143,15 +301,39 @@ class ScrapeHelper:
                                         mtype=MediaType.MOVIE if item.get("type") == "movie" else MediaType.TV)
         if not mediainfo:
             logger.warning(f"{info.title} TMDB 未识别到媒体信息")
-            return
+            return {"status": "skipped", "stage": "tmdb", "reason": "TMDB 未识别到媒体信息"}
 
         try:
             if self.need_trans_actor(item):
-                self.update_peoples(item=item, mediainfo=mediainfo, info=info)
+                plan = self.update_peoples(item=item, mediainfo=mediainfo, info=info)
+                if not plan:
+                    return {"status": "skipped", "stage": "plan", "reason": "未生成人物变更计划"}
+
+                if self._dry_run:
+                    logger.info(f"{info.title} 处于 dry-run 模式，仅记录预演结果，不写回 Plex")
+                    return {
+                        "status": "changed",
+                        "detail": self._detail_from_plan(info.title, plan.get("changes", [])),
+                        "backup_created": False,
+                    }
+
+                backup_created = False
+                if self._backup_enabled:
+                    backup_record = self._backup_actor_state(item=item, info=info, actors=plan.get("original_actors", []))
+                    backup_created = bool(backup_record)
+
+                self.put_actors(item=item, actors=plan.get("actors", []))
+                return {
+                    "status": "changed",
+                    "detail": self._detail_from_plan(info.title, plan.get("changes", [])),
+                    "backup_created": backup_created,
+                }
             else:
                 logger.info(f"{info.title} 的人物信息已是中文，无需更新")
+                return {"status": "skipped", "stage": "detect", "reason": "人物信息已是中文"}
         except Exception as e:
             logger.error(f"{info.title} 更新人物信息时出错：{str(e)}")
+            return {"status": "error", "stage": "update", "reason": str(e)}
 
     def need_trans_actor(self, item: dict) -> bool:
         """
@@ -185,7 +367,7 @@ class ScrapeHelper:
         return False
 
     def update_peoples(self, item: dict, mediainfo: MediaInfo, info: Optional[RatingInfo] = None):
-        """处理媒体项中的人物信息"""
+        """生成媒体项人物信息的变更计划。"""
         """
         item 的数据结构：
         {
@@ -221,10 +403,13 @@ class ScrapeHelper:
         }
         """
         if not mediainfo:
-            return
+            return None
 
         title = info.title if info and info.title else item.get("title")
-        actors = item.get("Role", [])
+        actors = copy.deepcopy(item.get("Role", []) or [])
+        if not actors:
+            return None
+        original_actors = [self._actor_payload(actor) for actor in actors]
         trans_actors = []
 
         # 将 mediainfo.actors 转换为字典，以 original_name、name、alias 和拼音为键
@@ -324,14 +509,21 @@ class ScrapeHelper:
                         except Exception as e:
                             logger.error(f"{title} 豆瓣更新人物信息失败：{str(e)}")
 
-        if trans_actors:
-            try:
-                self.put_actors(item=item, actors=trans_actors)
-                logger.info(f"{title} 的中文人物信息更新完成")
-            except Exception as e:
-                logger.error(f"{title} 的中文人物信息更新失败：{str(e)}")
+        final_actors = [self._actor_payload(actor) for actor in trans_actors]
+        changes = self._summarize_changes(original_actors, final_actors)
+        if not changes:
+            logger.info(f"{title} 未产生人物信息差异，跳过写回")
+            return None
 
-    def put_actors(self, item: dict, actors: list):
+        return {
+            "title": title,
+            "rating_key": item.get("ratingKey"),
+            "original_actors": original_actors,
+            "actors": final_actors,
+            "changes": changes,
+        }
+
+    def put_actors(self, item: dict, actors: list, locked: Optional[bool] = None):
         """更新演员信息"""
         if not item or not actors:
             return
@@ -356,8 +548,9 @@ class ScrapeHelper:
             # if self._reserve_tag_key:
             #     actors_param[f"{actor_index}.tag.art"] = actor_tag_key
 
+        lock_enabled = self._lock if locked is None else locked
         params = {
-            "actor.locked": 1 if self._lock else 0
+            "actor.locked": 1 if lock_enabled else 0
         }
         params.update(actors_param)
 
