@@ -11,8 +11,20 @@ from typing import Optional
 from app.core.cache import Cache
 from app.log import logger
 
+CACHE_TTL = 60 * 60 * 24 * 3
+NEGATIVE_CACHE_TTL = 60 * 5
+
 # 创建缓存实例
-cache_backend = Cache(maxsize=100000, ttl=60 * 60 * 24 * 3)
+cache_backend = Cache(maxsize=100000, ttl=CACHE_TTL)
+negative_cache_backend = Cache(maxsize=100000, ttl=NEGATIVE_CACHE_TTL)
+
+
+def clear_cache_regions():
+    """清理插件使用的所有缓存区域。"""
+    for backend in (cache_backend, negative_cache_backend):
+        backend.clear(region="plex_tmdb_media")
+        backend.clear(region="plex_tmdb_person")
+        backend.clear(region="plex_douban_media")
 
 
 @dataclass
@@ -43,14 +55,18 @@ def cache_with_logging(region, source):
             func_name = func.__name__
             args_str = str(args) + str(sorted(kwargs.items()))
             key = hashlib.md5((func_name + args_str).encode()).hexdigest()
-            
+
+            negative_exists_cache = negative_cache_backend.exists(key, region=region)
+            if negative_exists_cache:
+                value = negative_cache_backend.get(key, region=region)
+                if value == "None":
+                    logger.info(f"从缓存中获取到 {source} 信息为 None，可能是之前触发限流或网络异常")
+                    return None
+
             exists_cache = cache_backend.exists(key, region=region)
             if exists_cache:
                 value = cache_backend.get(key, region=region)
                 if value is not None:
-                    if value == "None":
-                        logger.info(f"从缓存中获取到 {source} 信息为 None，可能是之前触发限流或网络异常")
-                        return None
                     if source == "PERSON":
                         logger.info(f"从缓存中获取到 {source} 人物信息")
                     else:
@@ -63,7 +79,7 @@ def cache_with_logging(region, source):
 
             if result is None:
                 # 如果结果为 None，说明触发限流或网络等异常，缓存5分钟，以免高频次调用
-                cache_backend.set(key, "None", region=region)
+                negative_cache_backend.set(key, "None", region=region)
             else:
                 # 结果不为 None，使用默认 TTL 缓存
                 cache_backend.set(key, result, region=region)

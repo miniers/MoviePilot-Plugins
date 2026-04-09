@@ -3,18 +3,20 @@
     "name": "Plex演职人员刮削",
     "description": "实现刮削演职人员中文名称及角色。",
     "labels": "Plex,刮削",
-    "version": "2.3",
+    "version": "2.3.1",
     "icon": "https://raw.githubusercontent.com/miniers/MoviePilot-Plugins/main/icons/plexpersonmeta.png",
     "author": "miniers",
     "level": 1,
     "history": {
+      "v2.3.1": "修复缓存清理失效、失败结果缓存过久、入库调度器重入风险、服务为空时日志空对象访问，以及表单默认值与插件契约返回值漂移；同时切换为 Release 安装模式。",
       "v2.2": "可以设置定时任务只刮削最近入库的媒体",
       "v2.1": "修复插件启动失败",
       "v2.0": "兼容MoviePilot的Redis缓存方案，需要MoviePilot v2.2.3+",
       "v1.9": "修复了入库执行一次失效的问题",
       "v1.8": "优化执行周期输入，需要MoviePilot v2.2.1+",
       "v1.7": "MoviePilot V2 版本Plex演职人员刮削插件"
-    }
+    },
+    "release": true
   },
   "MPPlexTools": {
     "name": "MP Plex工具箱",

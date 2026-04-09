@@ -30,7 +30,7 @@ class PlexPersonMeta(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/InfinityPacer/MoviePilot-Plugins/main/icons/plexpersonmeta.png"
     # 插件版本
-    plugin_version = "2.3"
+    plugin_version = "2.3.1"
     # 插件作者
     plugin_author = "InfinityPacer"
     # 作者主页
@@ -54,6 +54,7 @@ class PlexPersonMeta(_PluginBase):
     _cron_added_time = None
     # 发送通知
     _notify = False
+    _lock = False
     # 需要处理的媒体库
     _libraries = None
     # 入库后运行一次
@@ -62,8 +63,12 @@ class PlexPersonMeta(_PluginBase):
     _delay = None
     # 最近一次入库时间
     _transfer_time = None
+    _scrape_type = "all"
+    _remove_no_zh = False
+    _douban_scrape = True
     # 清理缓存
     _clear_cache = None
+    _transfer_job_id = "plexpersonmeta_transfer_once"
     # 定时器
     _scheduler = None
     # 退出事件
@@ -79,9 +84,13 @@ class PlexPersonMeta(_PluginBase):
         self._onlyonce = config.get("onlyonce")
         self._cron = config.get("cron")
         self._notify = config.get("notify")
+        self._lock = bool(config.get("lock"))
         self._libraries = config.get("libraries", [])
         self._clear_cache = config.get("clear_cache")
         self._execute_transfer = config.get("execute_transfer")
+        self._scrape_type = config.get("scrape_type", "all") or "all"
+        self._remove_no_zh = bool(config.get("remove_no_zh", False))
+        self._douban_scrape = bool(config.get("douban_scrape", True))
         try:
             self._delay = int(config.get("delay", 200))
         except ValueError:
@@ -175,10 +184,10 @@ class PlexPersonMeta(_PluginBase):
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
-        pass
+        return []
 
     def get_api(self) -> List[Dict[str, Any]]:
-        pass
+        return []
 
     def get_service(self) -> List[Dict[str, Any]]:
         """
@@ -737,20 +746,24 @@ class PlexPersonMeta(_PluginBase):
                 ],
             }
         ], {
-            "enabled": False,
-            "notify": True,
-            "cron": "0 1 * * *",
-            "lock": False,
-            "execute_transfer": False,
-            "delay": 200,
-            "scrape_type": "all",
-            "remove_no_zh": False,
+            "enabled": bool(self._enabled),
+            "notify": True if self._notify is None else bool(self._notify),
+            "clear_cache": False,
+            "onlyonce": False,
+            "cron": self._cron or "0 1 * * *",
+            "cron_added_time": self._cron_added_time or 0,
+            "lock": bool(self._lock),
+            "execute_transfer": bool(self._execute_transfer),
+            "delay": self._delay or 200,
+            "scrape_type": self._scrape_type or "all",
+            "libraries": self._libraries or [],
+            "remove_no_zh": bool(self._remove_no_zh),
             # "reserve_tag_key": False,
-            "douban_scrape": True
+            "douban_scrape": bool(self._douban_scrape)
         }
 
     def get_page(self) -> List[dict]:
-        pass
+        return []
 
     def __get_service_library_options(self):
         """
@@ -873,17 +886,17 @@ class PlexPersonMeta(_PluginBase):
         if not self._scheduler:
             self._scheduler = BackgroundScheduler(timezone=settings.TZ)
 
-        self._scheduler.remove_all_jobs()
-
         self._scheduler.add_job(
             func=self.__scrape_by_transfer,
             trigger="date",
             run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=self._delay),
-            name=f"{self.plugin_name}",
+            id=self._transfer_job_id,
+            replace_existing=True,
+            name=f"{self.plugin_name}-transfer",
         )
 
         # 启动任务
-        if self._scheduler.get_jobs():
+        if self._scheduler.get_jobs() and not self._scheduler.running:
             self._scheduler.print_jobs()
             self._scheduler.start()
 
@@ -919,10 +932,12 @@ class PlexPersonMeta(_PluginBase):
             overall_start_time = time.time()
             plugin_config = self.get_config()
             service_libraries = self.__get_service_libraries()
+            if not service_libraries:
+                return
             for service_name, libraries in service_libraries.items():
                 service = self.service_info(name=service_name)
                 if not service or not service.instance:
-                    logger.info(f"获取媒体服务器 {service.name} 实例失败，跳过处理")
+                    logger.info(f"获取媒体服务器 {service_name} 实例失败，跳过处理")
                     continue
                 service_start_time = time.time()
                 scrape_helper = ScrapeHelper(config=plugin_config, event=self._event, chain=self.chain,
@@ -959,10 +974,12 @@ class PlexPersonMeta(_PluginBase):
             overall_start_time = time.time()
             plugin_config = self.get_config()
             service_libraries = self.__get_service_libraries()
+            if not service_libraries:
+                return
             for service_name, libraries in service_libraries.items():
                 service = self.service_info(name=service_name)
                 if not service or not service.instance:
-                    logger.info(f"获取媒体服务器 {service.name} 实例失败，跳过处理")
+                    logger.info(f"获取媒体服务器 {service_name} 实例失败，跳过处理")
                     continue
                 service_start_time = time.time()
                 scrape_helper = ScrapeHelper(config=plugin_config, event=self._event, chain=self.chain,
