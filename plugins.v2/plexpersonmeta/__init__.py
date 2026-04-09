@@ -2,6 +2,7 @@ import threading
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytz
@@ -15,6 +16,7 @@ from app.core.meta import MetaBase
 from app.helper.mediaserver import MediaServerHelper
 from app.log import logger
 from app.plugins import _PluginBase
+from app.plugins.plexpersonmeta.helper import read_json_file
 from app.plugins.plexpersonmeta.scrape import ScrapeHelper
 from app.schemas import ServiceInfo
 from app.schemas.types import EventType, NotificationType
@@ -30,7 +32,7 @@ class PlexPersonMeta(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/InfinityPacer/MoviePilot-Plugins/main/icons/plexpersonmeta.png"
     # 插件版本
-    plugin_version = "2.3.1"
+    plugin_version = "2.4.0"
     # 插件作者
     plugin_author = "InfinityPacer"
     # 作者主页
@@ -66,6 +68,10 @@ class PlexPersonMeta(_PluginBase):
     _scrape_type = "all"
     _remove_no_zh = False
     _douban_scrape = True
+    _dry_run = True
+    _backup_enabled = True
+    _restore_backup = False
+    _last_run_stats: Dict[str, Any] = {}
     # 清理缓存
     _clear_cache = None
     _transfer_job_id = "plexpersonmeta_transfer_once"
@@ -91,6 +97,9 @@ class PlexPersonMeta(_PluginBase):
         self._scrape_type = config.get("scrape_type", "all") or "all"
         self._remove_no_zh = bool(config.get("remove_no_zh", False))
         self._douban_scrape = bool(config.get("douban_scrape", True))
+        self._dry_run = bool(config.get("dry_run", True))
+        self._backup_enabled = bool(config.get("backup_enabled", True))
+        self._restore_backup = bool(config.get("restore_backup", False))
         try:
             self._delay = int(config.get("delay", 200))
         except ValueError:
@@ -130,11 +139,24 @@ class PlexPersonMeta(_PluginBase):
                 func=self.scrape_library,
                 trigger="date",
                 run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=6),
+                kwargs={"trigger_source": "onlyonce"},
                 name=f"{self.plugin_name}",
             )
             # 关闭一次性开关
             self._onlyonce = False
             config["onlyonce"] = False
+            self.update_config(config=config)
+
+        if self._restore_backup:
+            logger.info(f"{self.plugin_name} 恢复最近一次演员备份")
+            self._scheduler.add_job(
+                func=self.restore_last_backup,
+                trigger="date",
+                run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
+                name=f"{self.plugin_name}-restore",
+            )
+            self._restore_backup = False
+            config["restore_backup"] = False
             self.update_config(config=config)
 
         # 启动服务
@@ -184,10 +206,22 @@ class PlexPersonMeta(_PluginBase):
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
-        return []
+        return [{
+            "cmd": "/plex_person_meta",
+            "event": EventType.PluginAction,
+            "desc": "运行 Plex 演职人员刮削",
+            "category": "Plex",
+            "data": {"action": "plex_person_meta_run"},
+        }]
 
     def get_api(self) -> List[Dict[str, Any]]:
-        return []
+        return [{
+            "path": "/run",
+            "endpoint": self.api_run,
+            "methods": ["POST"],
+            "summary": "运行 Plex 演职人员刮削",
+            "description": "支持手动触发全量/最近入库、dry-run 预演，以及恢复最近一次备份",
+        }]
 
     def get_service(self) -> List[Dict[str, Any]]:
         """
@@ -207,7 +241,7 @@ class PlexPersonMeta(_PluginBase):
                 "name": f"{self.plugin_name}服务",
                 "trigger": CronTrigger.from_crontab(self._cron),
                 "func": self.scrape_library,
-                "kwargs": {}
+                "kwargs": {"trigger_source": "schedule"}
             }]
 
     def stop_service(self):
@@ -307,6 +341,24 @@ class PlexPersonMeta(_PluginBase):
                                         },
                                     }
                                 ],
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 3
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'restore_backup',
+                                            'label': '恢复最近一次备份',
+                                            'hint': '保存后恢复最近一次写回前生成的演员备份，仅执行一次。',
+                                            'persistent-hint': True
+                                        },
+                                    }
+                                ],
                             }
                         ],
                     },
@@ -362,6 +414,42 @@ class PlexPersonMeta(_PluginBase):
                                             'model': 'douban_scrape',
                                             'label': '豆瓣辅助识别',
                                             'hint': '提高识别率的同时将会降低性能',
+                                            'persistent-hint': True
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 4
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'dry_run',
+                                            'label': '仅预演不写回',
+                                            'hint': '开启后只分析将要修改的人物信息，不向 Plex 写入。',
+                                            'persistent-hint': True
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 4
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'backup_enabled',
+                                            'label': '写回前自动备份',
+                                            'hint': '关闭 dry-run 后，写回前先备份原始演员信息，便于回滚。',
                                             'persistent-hint': True
                                         }
                                     }
@@ -758,12 +846,107 @@ class PlexPersonMeta(_PluginBase):
             "scrape_type": self._scrape_type or "all",
             "libraries": self._libraries or [],
             "remove_no_zh": bool(self._remove_no_zh),
+            "dry_run": bool(self._dry_run),
+            "backup_enabled": bool(self._backup_enabled),
+            "restore_backup": False,
             # "reserve_tag_key": False,
             "douban_scrape": bool(self._douban_scrape)
         }
 
     def get_page(self) -> List[dict]:
-        return []
+        stats = self._last_run_stats or {}
+        summary = stats.get("summary") or "暂无执行记录。建议先使用 dry-run 预演确认差异，再关闭预演写回 Plex。"
+        details = stats.get("items") or []
+        skip_reasons = stats.get("skip_reasons") or []
+        backups = stats.get("backups") or []
+        restore = stats.get("restore") or {}
+
+        detail_text = "\n".join(details[:20]) if details else "暂无变更明细。"
+        skip_text = "\n".join(
+            f"- [{item.get('stage', 'unknown')}] {item.get('title', 'unknown')}: {item.get('reason', '未记录原因')}"
+            for item in skip_reasons[:20]
+        ) if skip_reasons else "暂无跳过或错误记录。"
+        backup_text = "\n".join(
+            f"- {item.get('title', 'unknown')} ({item.get('rating_key', '-')}) -> {item.get('backup_path', '-')}"
+            for item in backups[:10]
+        ) if backups else "本轮未产生备份。"
+        restore_text = restore.get("message") or "暂无恢复记录。"
+
+        return [
+            {
+                'component': 'VRow',
+                'content': [{
+                    'component': 'VCol',
+                    'props': {'cols': 12},
+                    'content': [
+                        {'component': 'VAlert', 'props': {'type': 'info', 'variant': 'tonal', 'text': summary}},
+                    ],
+                }],
+            },
+            {
+                'component': 'VRow',
+                'content': [{
+                    'component': 'VCol',
+                    'props': {'cols': 12},
+                    'content': [
+                        {'component': 'VAlert', 'props': {'type': 'info', 'variant': 'outlined', 'text': '最近一次执行明细'}},
+                        {'component': 'VAlert', 'props': {'type': 'info', 'variant': 'tonal', 'text': detail_text}},
+                    ],
+                }],
+            },
+            {
+                'component': 'VRow',
+                'content': [{
+                    'component': 'VCol',
+                    'props': {'cols': 12},
+                    'content': [
+                        {'component': 'VAlert', 'props': {'type': 'warning', 'variant': 'outlined', 'text': '最近跳过 / 错误记录'}},
+                        {'component': 'VAlert', 'props': {'type': 'warning', 'variant': 'tonal', 'text': skip_text}},
+                    ],
+                }],
+            },
+            {
+                'component': 'VRow',
+                'content': [{
+                    'component': 'VCol',
+                    'props': {'cols': 12},
+                    'content': [
+                        {'component': 'VAlert', 'props': {'type': 'info', 'variant': 'outlined', 'text': '最近一次备份'}},
+                        {'component': 'VAlert', 'props': {'type': 'info', 'variant': 'tonal', 'text': backup_text}},
+                    ],
+                }],
+            },
+            {
+                'component': 'VRow',
+                'content': [{
+                    'component': 'VCol',
+                    'props': {'cols': 12},
+                    'content': [
+                        {'component': 'VAlert', 'props': {'type': 'info', 'variant': 'outlined', 'text': '最近一次恢复'}},
+                        {'component': 'VAlert', 'props': {'type': 'info', 'variant': 'tonal', 'text': restore_text}},
+                    ],
+                }],
+            },
+        ]
+
+    def api_run(self, data: Optional[dict] = None):
+        payload = data or {}
+        mode = payload.get("mode", "full") if isinstance(payload, dict) else "full"
+        dry_run = payload.get("dry_run") if isinstance(payload, dict) else None
+        restore = bool(payload.get("restore_last_backup")) if isinstance(payload, dict) else False
+
+        if restore:
+            threading.Thread(target=self.restore_last_backup, daemon=True).start()
+            return {"success": True, "message": "恢复任务已启动", "restore": True}
+
+        kwargs = {"dry_run": self._dry_run if dry_run is None else bool(dry_run), "trigger_source": "api"}
+        target = self.scrape_library
+        if mode == "recent":
+            added_time = datetime.now(tz=pytz.timezone(settings.TZ)) - timedelta(minutes=max(self._cron_added_time or 60, 1))
+            target = self.scrape_library_by_added_time
+            kwargs["added_time"] = int(added_time.timestamp())
+        threading.Thread(target=target, kwargs=kwargs, daemon=True).start()
+        return {"success": True, "message": "任务已启动", "mode": mode, "dry_run": kwargs["dry_run"]}
 
     def __get_service_library_options(self):
         """
@@ -900,6 +1083,18 @@ class PlexPersonMeta(_PluginBase):
             self._scheduler.print_jobs()
             self._scheduler.start()
 
+    @eventmanager.register(EventType.PluginAction)
+    def handle_command(self, event: Event = None):
+        if not event or not event.event_data:
+            return
+        if event.event_data.get("action") != "plex_person_meta_run":
+            return
+        threading.Thread(
+            target=self.scrape_library,
+            kwargs={"dry_run": self._dry_run, "trigger_source": "command"},
+            daemon=True,
+        ).start()
+
     def __scrape_by_transfer(self):
         """入库后运行一次"""
         if not self._transfer_time:
@@ -911,21 +1106,32 @@ class PlexPersonMeta(_PluginBase):
         adjusted_time = self._transfer_time - timedelta(minutes=5)
         logger.info(f"为保证入库数据完整性，前偏移5分钟后的时间：{adjusted_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
-        self.scrape_library_by_added_time(added_time=int(adjusted_time.timestamp()))
+        self.scrape_library_by_added_time(added_time=int(adjusted_time.timestamp()), trigger_source="transfer")
         self._transfer_time = None
 
-    def scrape_library(self):
+    def scrape_library(self, dry_run: Optional[bool] = None, trigger_source: str = "manual"):
         """
         刮削媒体库中所有媒体的演员信息
         """
+        run_dry = self._dry_run if dry_run is None else bool(dry_run)
         if not self.__check_plex_media_server():
+            self._last_run_stats = {
+                "summary": "Plex 配置不正确或未选择媒体库，无法执行任务。",
+                "items": [],
+                "skip_reasons": [],
+                "backups": [],
+            }
             return
         
         # 如果设置了最近一次定时任务运行的入库时间范围，则优先处理该逻辑
-        if self._cron_added_time and self._cron_added_time > 0:
+        if trigger_source in {"schedule", "onlyonce"} and self._cron_added_time and self._cron_added_time > 0:
             logger.info(f"定时刮削，准备刮削最近 {self._cron_added_time} 分钟入库的媒体")
             added_time = datetime.now(tz=pytz.timezone(settings.TZ)) - timedelta(minutes=self._cron_added_time)
-            self.scrape_library_by_added_time(added_time=int(added_time.timestamp()))
+            self.scrape_library_by_added_time(
+                added_time=int(added_time.timestamp()),
+                dry_run=run_dry,
+                trigger_source=trigger_source,
+            )
             return
 
         with lock:
@@ -933,7 +1139,15 @@ class PlexPersonMeta(_PluginBase):
             plugin_config = self.get_config()
             service_libraries = self.__get_service_libraries()
             if not service_libraries:
+                self._last_run_stats = {
+                    "summary": "未找到可处理的 Plex 媒体库。",
+                    "items": [],
+                    "skip_reasons": [],
+                    "backups": [],
+                }
                 return
+            batch_id = datetime.now().strftime("%Y%m%d%H%M%S")
+            total_stats = {"processed": 0, "changed": 0, "skipped": 0, "errors": 0, "backed_up": 0, "items": [], "skip_reasons": [], "backups": []}
             for service_name, libraries in service_libraries.items():
                 service = self.service_info(name=service_name)
                 if not service or not service.instance:
@@ -941,7 +1155,9 @@ class PlexPersonMeta(_PluginBase):
                     continue
                 service_start_time = time.time()
                 scrape_helper = ScrapeHelper(config=plugin_config, event=self._event, chain=self.chain,
-                                             service=service, libraries=libraries)
+                                             service=service, libraries=libraries,
+                                             data_dir=self.__data_dir().as_posix(), dry_run=run_dry,
+                                             backup_enabled=self._backup_enabled, backup_batch_id=batch_id)
                 logger.info(f"开始处理媒体服务器 {service.name} 的媒体库")
 
                 for library_id, library in libraries.items():
@@ -952,22 +1168,39 @@ class PlexPersonMeta(_PluginBase):
                             logger.info(f"媒体库 {library.title} 没有找到任何媒体信息，跳过刮削")
                             continue
 
-                        scrape_helper.scrape_rating_items(rating_items=rating_items)
+                        self.__merge_run_stats(total_stats, scrape_helper.scrape_rating_items(rating_items=rating_items))
                         logger.info(f"媒体库 {library.title} 的演员信息刮削完成")
                     except Exception as e:
                         logger.error(f"媒体库 {library.title} 刮削过程中出现异常，{str(e)}")
+                        total_stats["errors"] += 1
+                        total_stats["skip_reasons"].append({"title": library.title, "stage": "library", "reason": str(e)})
+
+                total_stats["backups"].extend(scrape_helper.backup_records())
 
                 service_elapsed_time = time.time() - service_start_time
                 logger.info(f"媒体服务器 {service.name} 处理完成，耗时 {service_elapsed_time:.2f} 秒")
 
             overall_elapsed_time = time.time() - overall_start_time
-            message_text = f"演员信息刮削完成，用时 {overall_elapsed_time:.2f} 秒"
+            mode_text = "dry-run 预演" if run_dry else "写回模式"
+            message_text = f"演员信息{mode_text}完成，用时 {overall_elapsed_time:.2f} 秒，处理 {total_stats['processed']}，变更 {total_stats['changed']}，跳过 {total_stats['skipped']}，错误 {total_stats['errors']}"
+            self._last_run_stats = {
+                "summary": f"最近一次执行：来源={trigger_source}，模式={mode_text}，处理 {total_stats['processed']}，变更 {total_stats['changed']}，跳过 {total_stats['skipped']}，错误 {total_stats['errors']}，备份 {total_stats['backed_up']}。",
+                "items": total_stats["items"][-20:],
+                "skip_reasons": total_stats["skip_reasons"][-20:],
+                "backups": total_stats["backups"][-10:],
+            }
             self.__send_message(title="【媒体库演员信息刮削】", text=message_text)
             logger.info(message_text)
 
-    def scrape_library_by_added_time(self, added_time: int):
+    def scrape_library_by_added_time(self, added_time: int, dry_run: Optional[bool] = None, trigger_source: str = "manual"):
         """根据入库时间刮削媒体库中的演员信息"""
         if not self.__check_plex_media_server():
+            self._last_run_stats = {
+                "summary": "Plex 配置不正确或未选择媒体库，无法执行任务。",
+                "items": [],
+                "skip_reasons": [],
+                "backups": [],
+            }
             return
 
         with lock:
@@ -975,7 +1208,16 @@ class PlexPersonMeta(_PluginBase):
             plugin_config = self.get_config()
             service_libraries = self.__get_service_libraries()
             if not service_libraries:
+                self._last_run_stats = {
+                    "summary": "未找到可处理的 Plex 媒体库。",
+                    "items": [],
+                    "skip_reasons": [],
+                    "backups": [],
+                }
                 return
+            run_dry = self._dry_run if dry_run is None else bool(dry_run)
+            batch_id = datetime.now().strftime("%Y%m%d%H%M%S")
+            total_stats = {"processed": 0, "changed": 0, "skipped": 0, "errors": 0, "backed_up": 0, "items": [], "skip_reasons": [], "backups": []}
             for service_name, libraries in service_libraries.items():
                 service = self.service_info(name=service_name)
                 if not service or not service.instance:
@@ -983,7 +1225,9 @@ class PlexPersonMeta(_PluginBase):
                     continue
                 service_start_time = time.time()
                 scrape_helper = ScrapeHelper(config=plugin_config, event=self._event, chain=self.chain,
-                                             service=service, libraries=libraries)
+                                             service=service, libraries=libraries,
+                                             data_dir=self.__data_dir().as_posix(), dry_run=run_dry,
+                                             backup_enabled=self._backup_enabled, backup_batch_id=batch_id)
                 logger.info(f"开始处理媒体服务器 {service.name} 的媒体库")
 
                 for library_id, library in libraries.items():
@@ -1022,17 +1266,87 @@ class PlexPersonMeta(_PluginBase):
                     if not rating_items and not episode_items:
                         logger.info(f"媒体库 {library.title} 最近入库没有找到任何符合条件的媒体信息，跳过刮削")
                     else:
-                        scrape_helper.scrape_rating_items(rating_items=list(rating_items.values()))
-                        scrape_helper.scrape_episode_items(episode_items=episode_items)
+                        self.__merge_run_stats(total_stats, scrape_helper.scrape_rating_items(rating_items=list(rating_items.values())))
+                        self.__merge_run_stats(total_stats, scrape_helper.scrape_episode_items(episode_items=episode_items))
+
+                total_stats["backups"].extend(scrape_helper.backup_records())
 
                 service_elapsed_time = time.time() - service_start_time
                 logger.info(f"媒体服务器 {service.name} 处理完成，耗时 {service_elapsed_time:.2f} 秒")
 
             overall_elapsed_time = time.time() - overall_start_time
             formatted_added_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(added_time))
-            message_text = f"最近一次入库时间：{formatted_added_time}，演员信息刮削完成，用时 {overall_elapsed_time:.2f} 秒"
+            mode_text = "dry-run 预演" if run_dry else "写回模式"
+            message_text = f"最近一次入库时间：{formatted_added_time}，演员信息{mode_text}完成，用时 {overall_elapsed_time:.2f} 秒，处理 {total_stats['processed']}，变更 {total_stats['changed']}，跳过 {total_stats['skipped']}，错误 {total_stats['errors']}"
+            self._last_run_stats = {
+                "summary": f"最近一次执行：来源={trigger_source}，范围=最近入库，模式={mode_text}，处理 {total_stats['processed']}，变更 {total_stats['changed']}，跳过 {total_stats['skipped']}，错误 {total_stats['errors']}，备份 {total_stats['backed_up']}。",
+                "items": total_stats["items"][-20:],
+                "skip_reasons": total_stats["skip_reasons"][-20:],
+                "backups": total_stats["backups"][-10:],
+            }
             self.__send_message(title="【媒体库演员信息刮削】", text=message_text)
             logger.info(message_text)
+
+    def restore_last_backup(self):
+        restore_dir = self.__latest_backup_dir()
+        if not restore_dir:
+            self._last_run_stats["restore"] = {"message": "未找到可恢复的演员备份。"}
+            return
+
+        restored = 0
+        errors: List[str] = []
+        with lock:
+            for backup_file in sorted(restore_dir.glob("*.json")):
+                payload = read_json_file(backup_file)
+                if not payload:
+                    continue
+                service_name = payload.get("service_name")
+                rating_key = payload.get("rating_key")
+                actors = payload.get("actors") or []
+                if not service_name or not rating_key or not actors:
+                    continue
+                service = self.service_info(service_name)
+                if not service or not service.instance:
+                    errors.append(f"{payload.get('title', rating_key)}: 服务不可用")
+                    continue
+                helper = ScrapeHelper(config=self.get_config(), event=self._event, chain=self.chain,
+                                      service=service, libraries={}, data_dir=self.__data_dir().as_posix(),
+                                      dry_run=False, backup_enabled=False)
+                try:
+                    item = helper.fetch_item(rating_key=rating_key)
+                    if not item:
+                        errors.append(f"{payload.get('title', rating_key)}: 未找到条目")
+                        continue
+                    helper.put_actors(item=item, actors=actors, locked=self._lock)
+                    restored += 1
+                except Exception as err:
+                    errors.append(f"{payload.get('title', rating_key)}: {err}")
+
+        message = f"恢复最近一次备份完成，成功 {restored} 项"
+        if errors:
+            message = f"{message}，失败 {len(errors)} 项：" + "；".join(errors[:5])
+        self._last_run_stats.setdefault("restore", {})
+        self._last_run_stats["restore"] = {"message": message}
+        self.__send_message(title="【媒体库演员信息恢复】", text=message)
+
+    @staticmethod
+    def __merge_run_stats(total_stats: Dict[str, Any], delta: Dict[str, Any]):
+        for key in ["processed", "changed", "skipped", "errors", "backed_up"]:
+            total_stats[key] += int(delta.get(key, 0) or 0)
+        total_stats["items"].extend(delta.get("items", []) or [])
+        total_stats["skip_reasons"].extend(delta.get("skip_reasons", []) or [])
+
+    def __data_dir(self) -> Path:
+        return Path(self.get_data_path()) if hasattr(self, "get_data_path") else Path("/tmp") / "plexpersonmeta"
+
+    def __latest_backup_dir(self) -> Optional[Path]:
+        backup_root = self.__data_dir() / "actor_backups"
+        if not backup_root.exists():
+            return None
+        candidates = [path for path in backup_root.iterdir() if path.is_dir()]
+        if not candidates:
+            return None
+        return sorted(candidates)[-1]
 
     def __send_message(self, title: str, text: str):
         """
