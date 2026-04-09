@@ -3,11 +3,12 @@
     "name": "Plex演职人员刮削",
     "description": "实现刮削演职人员中文名称及角色。",
     "labels": "Plex,刮削",
-    "version": "2.4.0",
+    "version": "2.4.1",
     "icon": "https://raw.githubusercontent.com/miniers/MoviePilot-Plugins/main/icons/plexpersonmeta.png",
     "author": "miniers",
     "level": 1,
     "history": {
+      "v2.4.1": "补齐上一版遗漏提交的源码文件，正式发布 dry-run 预演、最近执行结果页、手动触发命令/API，以及写回前演员备份与恢复最近一次备份能力。",
       "v2.4.0": "新增 dry-run 预演、最近执行结果页、/plex_person_meta 命令与 /run API 手动触发，以及写回前演员备份与恢复最近一次备份能力。",
       "v2.3.1": "修复缓存清理失效、失败结果缓存过久、入库调度器重入风险、服务为空时日志空对象访问，以及表单默认值与插件契约返回值漂移；同时切换为 Release 安装模式。",
       "v2.2": "可以设置定时任务只刮削最近入库的媒体",
