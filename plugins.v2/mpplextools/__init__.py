@@ -20,7 +20,6 @@ from app.plugins import _PluginBase
 from app.schemas import ServiceInfo
 from app.schemas.types import EventType, NotificationType
 from plexapi.library import LibrarySection
-from plexapi import media
 
 from .poster import build_overlay_poster, download_poster, is_overlay_poster
 
@@ -31,7 +30,7 @@ class MPPlexTools(_PluginBase):
     plugin_name = "MP Plex工具箱"
     plugin_desc = "为 MoviePilot V2 提供 Plex 中文本地化、Fanart 封面优选和海报信息叠加。"
     plugin_icon = "https://github.com/miniers/MoviePilot-Plugins/blob/main/icons/mpplextools.jpg?raw=true"
-    plugin_version = "0.1.11"
+    plugin_version = "0.1.12"
     plugin_author = "miniers"
     author_url = "https://github.com/miniers/MoviePilot-Plugins"
     plugin_config_prefix = "mpplextools_"
@@ -440,7 +439,7 @@ class MPPlexTools(_PluginBase):
                 "content": [
                     self._col([
                         {"component": "VAlert", "props": {"type": "info", "variant": "outlined", "text": "最近一次执行明细"}},
-                        {"component": "VAceEditor", "props": {"modelvalue": detail_text, "lang": "text", "theme": "monokai", "readonly": True, "style": "height: 14rem"}},
+                        {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "text": detail_text}},
                     ])
                 ],
             },
@@ -449,7 +448,7 @@ class MPPlexTools(_PluginBase):
                 "content": [
                     self._col([
                         {"component": "VAlert", "props": {"type": "warning", "variant": "outlined", "text": "最近跳过 / 诊断记录"}},
-                        {"component": "VAceEditor", "props": {"modelvalue": skip_text, "lang": "text", "theme": "monokai", "readonly": True, "style": "height: 14rem"}},
+                        {"component": "VAlert", "props": {"type": "warning", "variant": "tonal", "text": skip_text}},
                     ])
                 ],
             },
@@ -458,7 +457,7 @@ class MPPlexTools(_PluginBase):
                 "content": [
                     self._col([
                         {"component": "VAlert", "props": {"type": "info", "variant": "outlined", "text": "最近一次海报调试预览"}},
-                        {"component": "VAceEditor", "props": {"modelvalue": preview_text, "lang": "text", "theme": "monokai", "readonly": True, "style": "height: 10rem"}},
+                        {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "text": preview_text}},
                     ])
                 ],
             },
@@ -466,7 +465,7 @@ class MPPlexTools(_PluginBase):
                 "component": "VRow",
                 "content": [
                     self._col([
-                        {"component": "VImg", "props": {"src": preview.get("image_url"), "max-width": 320, "cover": False}} if preview.get("image_url") else {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "text": preview_text}}
+                        {"component": "VAlert", "props": {"type": "info", "variant": "outlined", "text": f"预览图片路径：{preview.get('image_url') or '暂无'}"}}
                     ])
                 ],
             },
@@ -833,7 +832,6 @@ class MPPlexTools(_PluginBase):
                 return []
             return server.fetchItems(
                 f"/hubs/home/recentlyAdded?type={type_id}&sectionID={section_id}",
-                cls=media.Video,
                 container_start=0,
                 container_size=limit,
                 maxresults=limit,
