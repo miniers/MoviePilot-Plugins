@@ -1,6 +1,7 @@
 import json
 import threading
 import time
+import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,6 +20,7 @@ from app.plugins import _PluginBase
 from app.schemas import ServiceInfo
 from app.schemas.types import EventType, NotificationType
 from plexapi.library import LibrarySection
+from plexapi import media
 
 from .poster import build_overlay_poster, download_poster, is_overlay_poster
 
@@ -29,7 +31,7 @@ class MPPlexTools(_PluginBase):
     plugin_name = "MP Plex工具箱"
     plugin_desc = "为 MoviePilot V2 提供 Plex 中文本地化、Fanart 封面优选和海报信息叠加。"
     plugin_icon = "https://github.com/miniers/MoviePilot-Plugins/blob/main/icons/mpplextools.jpg?raw=true"
-    plugin_version = "0.1.10"
+    plugin_version = "0.1.11"
     plugin_author = "miniers"
     author_url = "https://github.com/miniers/MoviePilot-Plugins"
     plugin_config_prefix = "mpplextools_"
@@ -58,9 +60,12 @@ class MPPlexTools(_PluginBase):
     _custom_tags_json = ""
     _scheduler = None
     _event = threading.Event()
-    _last_transfer_at = 0.0
+    _transfer_debounce: Dict[str, float] = {}
     _transfer_refresh_retries = 6
     _transfer_refresh_interval = 10
+    _backup_retention_days = 30
+    _last_run_stats: Dict[str, Any] = {}
+    _recent_skip_reasons: List[Dict[str, str]] = []
 
     _default_tags = {
         "Anime": "动画",
@@ -135,6 +140,10 @@ class MPPlexTools(_PluginBase):
             self._batch_size = int(config.get("batch_size", 100))
         except Exception:
             self._batch_size = 100
+        try:
+            self._backup_retention_days = int(config.get("backup_retention_days", 30))
+        except Exception:
+            self._backup_retention_days = 30
 
         self.stop_service()
 
@@ -168,6 +177,7 @@ class MPPlexTools(_PluginBase):
             "delay": self._delay,
             "recent_limit": self._recent_limit,
             "batch_size": self._batch_size,
+            "backup_retention_days": self._backup_retention_days,
             "custom_tags_json": self._custom_tags_json,
         })
 
@@ -212,181 +222,171 @@ class MPPlexTools(_PluginBase):
         return []
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
+        plex_items = [
+            {"title": config.name, "value": config.name}
+            for config in self.mediaserver_helper.get_configs().values()
+            if config.type == "plex"
+        ]
+
+        content = [
+            self._alert_row(
+                "MP Plex工具箱会在你选择的 Plex 服务器与媒体库上执行标签中文化、拼音排序、Fanart 优选、海报叠加和元数据锁定整理。建议先只选择一个媒体库做小范围验证，确认效果后再扩大范围。"
+            ),
+            self._alert_row(
+                "入库事件模式会在 TransferComplete 后尝试触发 Plex 按路径局部刷新，并在短时间内重试定位新条目。如果宿主挂载、Plex 媒体库路径或扫描权限异常，入库后整理可能会延迟或跳过。",
+                alert_type="warning",
+            ),
+            self._alert_row(
+                "一、执行入口：控制插件何时触发。建议先用“立即运行一次”验证，再视情况开启定时和入库后执行。",
+                variant="outlined",
+            ),
+            self._row(
+                self._switch_col("enabled", "启用插件", "关闭后不会响应定时任务、命令或入库事件。"),
+                self._switch_col("onlyonce", "立即运行一次", "保存后约 3 秒触发一次最近条目整理，仅生效一次并自动复位。"),
+                self._switch_col("notify", "发送通知", "整理完成后发送站内通知，便于确认处理条目数和运行模式。"),
+                self._switch_col("execute_transfer", "入库后执行", "收到 TransferComplete 后按目标路径触发 Plex 局部刷新，再尝试命中新入库条目继续整理。"),
+            ),
+            self._row(
+                self._cron_col("cron", "执行周期", "仅在插件启用时生效；建议避开 Plex 自身的大规模扫描时间段。"),
+                self._text_col("delay", "入库延迟秒数", "TransferComplete 后先等待这段时间，再触发局部刷新与新条目定位。Plex 扫描慢时可适当调大。"),
+            ),
+            self._alert_row(
+                "二、整理能力：决定插件对命中的媒体做什么处理。海报叠加会联动 show、season、episode，建议先在单库验证样式。",
+                variant="outlined",
+            ),
+            self._row(
+                self._switch_col("translate_tags", "标签中文化", "将命中的英文类型标签替换为内置或自定义中文标签。"),
+                self._switch_col("sort_title", "拼音排序", "根据标题首字母生成 `titleSort`，便于中文媒体在 Plex 中按拼音排序。"),
+                self._switch_col("fanart", "优选 Fanart", "优先选取 provider 为 fanarttv 的海报和背景；对应字段已锁定时会自动跳过。"),
+            ),
+            self._row(
+                self._switch_col("overlay_poster", "海报叠加媒体信息", "在原始海报底部叠加分辨率、HDR/DV、时长和评分，并优先使用未叠加海报或历史备份。"),
+                self._switch_col("lock_metadata", "整理后锁定相关元数据", "对已写入的海报、背景或标签调用 Plex 锁定接口，避免后续刮削覆盖。"),
+                self._switch_col("collection", "处理合集", "整理时额外扫描合集对象；数量多时会明显增加执行时间。"),
+            ),
+            self._row(
+                self._select_col(
+                    "run_mode",
+                    "运行模式",
+                    [
+                        {"title": "全部整理", "value": "run_all"},
+                        {"title": "仅锁定海报背景", "value": "run_locked"},
+                        {"title": "仅解锁海报背景", "value": "run_unlocked"},
+                    ],
+                    "全部整理会执行所有已开启能力；锁定/解锁模式只处理海报和背景锁定状态，不做标签、排序或海报叠加。",
+                    md=8,
+                ),
+            ),
+            self._alert_row(
+                "三、执行范围：限制插件作用在哪些 Plex 服务器、媒体库和条目范围上。最近条目模式按 addedAt 倒序截取，全量模式按批次数量处理。",
+                variant="outlined",
+            ),
+            self._row(
+                self._text_col("recent_limit", "最近条目数", "最近条目模式下每个媒体库最多处理多少个最新条目；建议先用小值验证。"),
+                self._text_col("batch_size", "全量模式处理数", "全量模式下每个媒体库本轮最多处理多少个条目；数值越大执行时间越长。"),
+                self._switch_col("verbose_logging", "输出详细日志", "打印海报选择、局部刷新、条目搜索和字段处理细节，排障时开启即可."),
+            ),
+            self._row(
+                self._multi_select_col(
+                    "mediaservers",
+                    "Plex 媒体服务器",
+                    plex_items,
+                    "留空表示处理所有在线的 Plex 服务；建议先只选一个服务做效果验证。",
+                ),
+                full_width=True,
+            ),
+            self._row(
+                self._multi_select_col(
+                    "libraries",
+                    "媒体库（留空=全部）",
+                    self._library_options(),
+                    "支持选择“服务名:媒体库名”精确范围；留空表示扫描所选服务的全部非照片媒体库。",
+                ),
+                full_width=True,
+            ),
+            self._alert_row(
+                "四、高级与自定义：只有在默认内置标签不满足需求时，再修改自定义标签 JSON。JSON 解析失败时会自动回退到内置映射。",
+                variant="outlined",
+            ),
+            self._row(
+                self._text_col("backup_retention_days", "海报备份保留天数", "海报原始备份超过该天数后会在执行开始时清理；填 0 或负数表示不自动清理。"),
+            ),
+            self._row(
+                {
+                    "component": "VCol",
+                    "props": {"cols": 12},
+                    "content": [{
+                        "component": "VAceEditor",
+                        "props": {"modelvalue": "custom_tags_json", "lang": "json", "theme": "monokai", "style": "height: 20rem"},
+                    }],
+                }
+            ),
+            self._alert_row(
+                "自定义标签 JSON 格式示例：{\"Action\": \"动作\", \"Science Fiction\": \"科幻\"}。插件会先追加中文标签，再移除命中的英文标签。"
+            ),
+        ]
+
         return [
             {
                 "component": "VForm",
-                "content": [
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
-                                "content": [{"component": "VSwitch", "props": {"model": "enabled", "label": "启用插件"}}],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
-                                "content": [{"component": "VSwitch", "props": {"model": "onlyonce", "label": "立即运行一次"}}],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
-                                "content": [{"component": "VSwitch", "props": {"model": "notify", "label": "发送通知"}}],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
-                                "content": [{"component": "VSwitch", "props": {"model": "execute_transfer", "label": "入库后执行"}}],
-                            },
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [{"component": "VSwitch", "props": {"model": "translate_tags", "label": "标签中文化"}}],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [{"component": "VSwitch", "props": {"model": "sort_title", "label": "拼音排序"}}],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [{"component": "VSwitch", "props": {"model": "fanart", "label": "优选 Fanart"}}],
-                            },
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [{"component": "VSwitch", "props": {"model": "collection", "label": "处理合集"}}],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 8},
-                                "content": [{
-                                    "component": "VSelect",
-                                    "props": {
-                                        "model": "run_mode",
-                                        "label": "运行模式",
-                                        "items": [
-                                            {"title": "全部整理", "value": "run_all"},
-                                            {"title": "仅锁定海报背景", "value": "run_locked"},
-                                            {"title": "仅解锁海报背景", "value": "run_unlocked"}
-                                        ]
-                                    }
-                                }],
-                            }
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [{"component": "VSwitch", "props": {"model": "overlay_poster", "label": "海报叠加媒体信息"}}],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [{"component": "VSwitch", "props": {"model": "lock_metadata", "label": "整理后锁定相关元数据"}}],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [{"component": "VSwitch", "props": {"model": "verbose_logging", "label": "输出详细日志"}}],
-                            },
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [{"component": "VCronField", "props": {"model": "cron", "label": "执行周期"}}],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [{"component": "VTextField", "props": {"model": "delay", "label": "入库延迟秒数"}}],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [{"component": "VTextField", "props": {"model": "recent_limit", "label": "最近条目数"}}],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [{"component": "VTextField", "props": {"model": "batch_size", "label": "全量模式处理数"}}],
-                            },
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12},
-                                "content": [{
-                                    "component": "VSelect",
-                                    "props": {
-                                        "multiple": True,
-                                        "chips": True,
-                                        "clearable": True,
-                                        "model": "mediaservers",
-                                        "label": "Plex 媒体服务器",
-                                        "items": [{"title": config.name, "value": config.name}
-                                                  for config in self.mediaserver_helper.get_configs().values()
-                                                  if config.type == "plex"],
-                                    },
-                                }],
-                            }
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12},
-                                "content": [{
-                                    "component": "VSelect",
-                                    "props": {
-                                        "multiple": True,
-                                        "chips": True,
-                                        "clearable": True,
-                                        "model": "libraries",
-                                        "label": "媒体库（留空=全部）",
-                                        "items": self._library_options(),
-                                    },
-                                }],
-                            }
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12},
-                                "content": [{"component": "VAceEditor", "props": {"modelvalue": "custom_tags_json", "lang": "json", "theme": "monokai", "style": "height: 20rem"}}],
-                            }
-                        ],
-                    },
-                ],
+                "content": content,
             }
         ], self._form_defaults()
+
+    @staticmethod
+    def _row(*content: dict, full_width: bool = False) -> Dict[str, Any]:
+        if full_width:
+            return {"component": "VRow", "content": list(content)}
+        return {"component": "VRow", "content": list(content)}
+
+    @staticmethod
+    def _col(content: List[dict], cols: int = 12, md: Optional[int] = None) -> Dict[str, Any]:
+        props = {"cols": cols}
+        if md is not None:
+            props["md"] = md
+        return {"component": "VCol", "props": props, "content": content}
+
+    def _switch_col(self, model: str, label: str, hint: str, md: int = 4) -> Dict[str, Any]:
+        return self._col([
+            {"component": "VSwitch", "props": {"model": model, "label": label, "hint": hint, "persistent-hint": True}}
+        ], md=md)
+
+    def _text_col(self, model: str, label: str, hint: str, md: int = 4) -> Dict[str, Any]:
+        return self._col([
+            {"component": "VTextField", "props": {"model": model, "label": label, "hint": hint, "persistent-hint": True}}
+        ], md=md)
+
+    def _cron_col(self, model: str, label: str, hint: str, md: int = 4) -> Dict[str, Any]:
+        return self._col([
+            {"component": "VCronField", "props": {"model": model, "label": label, "hint": hint, "persistent-hint": True}}
+        ], md=md)
+
+    def _select_col(self, model: str, label: str, items: List[Dict[str, Any]], hint: str, md: int = 4) -> Dict[str, Any]:
+        return self._col([
+            {"component": "VSelect", "props": {"model": model, "label": label, "items": items, "hint": hint, "persistent-hint": True}}
+        ], md=md)
+
+    def _multi_select_col(self, model: str, label: str, items: List[Dict[str, Any]], hint: str) -> Dict[str, Any]:
+        return self._col([
+            {
+                "component": "VSelect",
+                "props": {
+                    "multiple": True,
+                    "chips": True,
+                    "clearable": True,
+                    "model": model,
+                    "label": label,
+                    "items": items,
+                    "hint": hint,
+                    "persistent-hint": True,
+                },
+            }
+        ])
+
+    def _alert_row(self, text: str, alert_type: str = "info", variant: str = "tonal") -> Dict[str, Any]:
+        return self._row(self._col([
+            {"component": "VAlert", "props": {"type": alert_type, "variant": variant, "text": text}}
+        ]))
 
     def _form_defaults(self) -> Dict[str, Any]:
         return {
@@ -406,13 +406,71 @@ class MPPlexTools(_PluginBase):
             "delay": self._delay,
             "recent_limit": self._recent_limit,
             "batch_size": self._batch_size,
+            "backup_retention_days": self._backup_retention_days,
             "mediaservers": self._mediaservers,
             "libraries": self._libraries,
             "custom_tags_json": self._custom_tags_json or self._preset_tags_json(),
         }
 
     def get_page(self) -> List[dict]:
-        pass
+        stats = self._last_run_stats or {}
+        summary = stats.get("summary") or "暂无执行记录，先运行一次整理后这里会展示结果。"
+        details = stats.get("details") or []
+        skip_reasons = self._recent_skip_reasons[-20:]
+        preview = stats.get("poster_preview") or {}
+
+        detail_text = "\n".join(details) if details else "暂无分媒体库明细。"
+        skip_text = "\n".join(
+            f"- [{item.get('stage', 'unknown')}] {item.get('title', 'unknown')}: {item.get('reason', '未记录原因')}"
+            for item in skip_reasons
+        ) if skip_reasons else "暂无跳过记录。"
+        preview_text = preview.get("message") or "暂无海报调试预览记录。"
+
+        return [
+            {
+                "component": "VRow",
+                "content": [
+                    self._col([
+                        {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "text": summary}}
+                    ])
+                ],
+            },
+            {
+                "component": "VRow",
+                "content": [
+                    self._col([
+                        {"component": "VAlert", "props": {"type": "info", "variant": "outlined", "text": "最近一次执行明细"}},
+                        {"component": "VAceEditor", "props": {"modelvalue": detail_text, "lang": "text", "theme": "monokai", "readonly": True, "style": "height: 14rem"}},
+                    ])
+                ],
+            },
+            {
+                "component": "VRow",
+                "content": [
+                    self._col([
+                        {"component": "VAlert", "props": {"type": "warning", "variant": "outlined", "text": "最近跳过 / 诊断记录"}},
+                        {"component": "VAceEditor", "props": {"modelvalue": skip_text, "lang": "text", "theme": "monokai", "readonly": True, "style": "height: 14rem"}},
+                    ])
+                ],
+            },
+            {
+                "component": "VRow",
+                "content": [
+                    self._col([
+                        {"component": "VAlert", "props": {"type": "info", "variant": "outlined", "text": "最近一次海报调试预览"}},
+                        {"component": "VAceEditor", "props": {"modelvalue": preview_text, "lang": "text", "theme": "monokai", "readonly": True, "style": "height: 10rem"}},
+                    ])
+                ],
+            },
+            {
+                "component": "VRow",
+                "content": [
+                    self._col([
+                        {"component": "VImg", "props": {"src": preview.get("image_url"), "max-width": 320, "cover": False}} if preview.get("image_url") else {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "text": preview_text}}
+                    ])
+                ],
+            },
+        ]
 
 
     def stop_service(self):
@@ -461,16 +519,26 @@ class MPPlexTools(_PluginBase):
         if not transferinfo or not mediainfo:
             return
         target_path = None
+        debounce_key = None
         if getattr(transferinfo, "target_item", None) and getattr(transferinfo.target_item, "path", None):
             target_path = str(transferinfo.target_item.path)
+            debounce_key = str(Path(target_path).parent)
         elif getattr(transferinfo, "target_diritem", None) and getattr(transferinfo.target_diritem, "path", None):
             target_path = str(transferinfo.target_diritem.path)
+            debounce_key = target_path
         if not target_path:
             return
-        if time.time() - self._last_transfer_at < max(self._delay, 1):
+        debounce_key = debounce_key or self._transfer_debounce_key(target_path)
+        now = time.time()
+        if now - self._transfer_debounce.get(debounce_key, 0.0) < max(self._delay, 1):
             return
-        self._last_transfer_at = time.time()
+        self._transfer_debounce[debounce_key] = now
         threading.Thread(target=self._process_transfer_path, args=(target_path, mediainfo.title), daemon=True).start()
+
+    @staticmethod
+    def _transfer_debounce_key(target_path: str) -> str:
+        path = Path(target_path)
+        return path.parent.as_posix() if path.parent else path.as_posix()
 
     def run_full_scan(
         self,
@@ -486,6 +554,18 @@ class MPPlexTools(_PluginBase):
             return
         current_run_mode = run_mode or self._run_mode
         current_collection = self._collection if collection is None else collection
+        self._recent_skip_reasons = []
+        stats = {
+            "started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "trigger_source": trigger_source,
+            "recent_only": recent_only,
+            "run_mode": current_run_mode,
+            "services": [],
+            "processed": 0,
+            "skipped": 0,
+            "errors": 0,
+        }
+        self._cleanup_old_backups()
         with lock:
             total = 0
             for service in self._service_infos().values():
@@ -493,21 +573,58 @@ class MPPlexTools(_PluginBase):
                 if not plex:
                     continue
                 for section in self._iter_sections(service, plex, libraries):
-                    total += self._process_section(
-                        section,
+                    processed, skipped, errors = self._process_section(
+                        service=service,
+                        section=section,
                         recent_only=recent_only,
                         run_mode=current_run_mode,
                         collection=current_collection,
                         ignore_overlay_marker=ignore_overlay_marker,
                         trigger_source=trigger_source,
                     )
+                    total += processed
+                    stats["processed"] += processed
+                    stats["skipped"] += skipped
+                    stats["errors"] += errors
+                    stats["services"].append(
+                        f"{service.name}/{section.title}: processed={processed}, skipped={skipped}, errors={errors}"
+                    )
+            stats["finished_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            scope = "最近条目" if recent_only else "全量媒体库"
+            stats["summary"] = (
+                f"最近一次执行：{scope}，来源={self._trigger_source_label(trigger_source)}，模式={current_run_mode}，"
+                f"处理 {stats['processed']}，跳过 {stats['skipped']}，错误 {stats['errors']}。"
+            )
+            stats["details"] = stats["services"]
+            self._last_run_stats = stats
             if self._notify:
-                scope = "最近条目" if recent_only else "全量媒体库"
                 self.post_message(
                     mtype=NotificationType.SiteMessage,
                     title=f"【{self.plugin_name}】",
                     text=f"{scope}整理完成，处理条目 {total} 个，模式：{current_run_mode}",
                 )
+
+    def _cleanup_old_backups(self):
+        if self._backup_retention_days <= 0:
+            return
+        try:
+            base_dir = Path(self.get_data_path()) if hasattr(self, "get_data_path") else Path("/tmp") / "mpplextools"
+            backup_dir = base_dir / "poster_backup"
+            if not backup_dir.exists():
+                return
+            expire_before = time.time() - self._backup_retention_days * 86400
+            removed = 0
+            for file_path in backup_dir.glob("*.jpg"):
+                try:
+                    if file_path.stat().st_mtime < expire_before:
+                        file_path.unlink(missing_ok=True)
+                        removed += 1
+                except Exception as err:
+                    self._verbose(f"清理海报备份失败: {file_path} - {err}")
+            if removed:
+                logger.info(f"{self.plugin_name} 已清理过期海报备份 {removed} 个，保留天数: {self._backup_retention_days}")
+        except Exception as err:
+            logger.warning(f"{self.plugin_name} 清理海报备份失败: {err}")
 
     def _process_transfer_path(self, target_path: str, title: str):
         time.sleep(max(self._delay, 1))
@@ -651,69 +768,117 @@ class MPPlexTools(_PluginBase):
 
     def _process_section(
         self,
+        service: ServiceInfo,
         section: LibrarySection,
         recent_only: bool = True,
         run_mode: str = "run_all",
         collection: bool = False,
         ignore_overlay_marker: bool = False,
         trigger_source: str = "manual",
-    ) -> int:
+    ) -> Tuple[int, int, int]:
         count = 0
+        skipped = 0
+        errors = 0
         if collection:
-            count += self._process_collections(
-                section,
+            processed, skipped_count, error_count = self._process_collections(
+                service=service,
+                section=section,
                 recent_only=recent_only,
                 run_mode=run_mode,
                 ignore_overlay_marker=ignore_overlay_marker,
                 trigger_source=trigger_source,
             )
-        items = section.all()
-        items.sort(key=lambda item: getattr(item, "addedAt", datetime.min), reverse=True)
-        limit = max(self._recent_limit, 1) if recent_only else self._batch_size
-        target_items = items[:limit]
+            count += processed
+            skipped += skipped_count
+            errors += error_count
+        target_items = self._target_section_items(section, recent_only=recent_only)
         for item in target_items:
             if self._event.is_set():
-                return count
+                return count, skipped, errors
             try:
-                self._process_item(
+                processed = self._process_item(
                     item,
                     run_mode=run_mode,
                     ignore_overlay_marker=ignore_overlay_marker,
                     trigger_source=trigger_source,
                 )
-                count += 1
+                if processed:
+                    count += 1
+                else:
+                    skipped += 1
+                    self._record_skip_reason(item, "process", "当前配置或条目条件下未执行任何变更")
             except Exception as err:
                 logger.error(f"处理 {section.title}/{getattr(item, 'title', 'unknown')} 失败: {err}")
-        return count
+                errors += 1
+                self._record_skip_reason(item, "error", str(err))
+        return count, skipped, errors
+
+    def _target_section_items(self, section: LibrarySection, recent_only: bool = True):
+        limit = max(self._recent_limit, 1) if recent_only else self._batch_size
+        if recent_only:
+            items = self._recently_added_items(section, limit)
+            if items:
+                return items
+        items = section.all()
+        items.sort(key=lambda item: getattr(item, "addedAt", datetime.min), reverse=True)
+        return items[:limit]
+
+    def _recently_added_items(self, section: LibrarySection, limit: int):
+        try:
+            item_type = getattr(section, "type", "")
+            type_id = 1 if item_type == "movie" else 2 if item_type == "show" else None
+            server = getattr(section, "_server", None)
+            section_id = getattr(section, "key", None)
+            if not type_id or not server or not section_id or not hasattr(server, "fetchItems"):
+                return []
+            return server.fetchItems(
+                f"/hubs/home/recentlyAdded?type={type_id}&sectionID={section_id}",
+                cls=media.Video,
+                container_start=0,
+                container_size=limit,
+                maxresults=limit,
+            ) or []
+        except Exception as err:
+            self._verbose(f"获取 {getattr(section, 'title', 'unknown')} 最近新增条目失败，回退到 section.all(): {err}")
+            return []
 
     def _process_collections(
         self,
+        service: ServiceInfo,
         section: LibrarySection,
         recent_only: bool = True,
         run_mode: str = "run_all",
         ignore_overlay_marker: bool = False,
         trigger_source: str = "manual",
-    ) -> int:
+    ) -> Tuple[int, int, int]:
         count = 0
+        skipped = 0
+        errors = 0
         try:
             collections = section.collections() or []
         except Exception:
-            return 0
+            return 0, 0, 0
         collections.sort(key=lambda item: getattr(item, "addedAt", datetime.min), reverse=True)
         limit = max(self._recent_limit, 1) if recent_only else self._batch_size
         target_items = collections[:limit]
         for collection in target_items:
             try:
-                self._process_item(
+                processed = self._process_item(
                     collection,
                     run_mode=run_mode,
                     ignore_overlay_marker=ignore_overlay_marker,
                     trigger_source=trigger_source,
                 )
-                count += 1
+                if processed:
+                    count += 1
+                else:
+                    skipped += 1
+                    self._record_skip_reason(collection, "collection", "当前配置下合集未执行任何变更")
             except Exception as err:
                 logger.error(f"处理合集 {section.title}/{getattr(collection, 'title', 'unknown')} 失败: {err}")
-        return count
+                errors += 1
+                self._record_skip_reason(collection, "collection-error", str(err))
+        return count, skipped, errors
 
     def _process_item(
         self,
@@ -721,29 +886,43 @@ class MPPlexTools(_PluginBase):
         run_mode: str = "run_all",
         ignore_overlay_marker: bool = False,
         trigger_source: str = "manual",
-    ):
+    ) -> bool:
         if run_mode == "run_locked":
             self._lock_item_images(item)
             self._process_related_children(item, run_mode=run_mode, trigger_source=trigger_source)
-            return
+            return True
         if run_mode == "run_unlocked":
             self._unlock_item_images(item)
             self._process_related_children(item, run_mode=run_mode, trigger_source=trigger_source)
-            return
+            return True
+        changed = False
         if self._fanart:
             self._apply_fanart(item)
+            changed = True
         if self._translate_tags:
             self._translate_item_tags(item)
+            changed = True
         if self._sort_title:
             self._update_sort_title(item)
-        if self._overlay_poster:
+            changed = True
+        if self._overlay_poster and getattr(item, "type", "") not in {"show", "season"}:
             self._overlay_item_poster(item, ignore_overlay_marker=ignore_overlay_marker, trigger_source=trigger_source)
+            changed = True
         self._process_related_children(
             item,
             run_mode=run_mode,
             ignore_overlay_marker=ignore_overlay_marker,
             trigger_source=trigger_source,
         )
+        return changed or (self._overlay_poster and getattr(item, "type", "") in {"show", "season"})
+
+    def _record_skip_reason(self, item, stage: str, reason: str):
+        self._recent_skip_reasons.append({
+            "title": getattr(item, "title", "unknown") or "unknown",
+            "stage": stage,
+            "reason": reason,
+        })
+        self._recent_skip_reasons = self._recent_skip_reasons[-50:]
 
     def _lock_item_images(self, item):
         try:
@@ -866,9 +1045,11 @@ class MPPlexTools(_PluginBase):
     def _overlay_item_poster(self, item, ignore_overlay_marker: bool = False, trigger_source: str = "manual"):
         item_type = getattr(item, "type", "")
         if item_type not in {"movie", "show", "season", "episode"}:
+            self._record_skip_reason(item, "overlay", f"不支持的条目类型: {item_type}")
             return
         poster_path = self._source_poster_path(item, ignore_overlay_marker=ignore_overlay_marker, trigger_source=trigger_source)
         if not poster_path:
+            self._record_skip_reason(item, "overlay", "未找到可用于叠加的原始海报")
             return
         resolution, dynamic_range, duration_text, rating_text = self._media_overlay_info(item)
         self._verbose(
@@ -886,8 +1067,29 @@ class MPPlexTools(_PluginBase):
         )
         item.uploadPoster(filepath=str(overlay_path))
         self._verbose(f"{getattr(item, 'title', 'unknown')} 海报叠加完成并已上传: {overlay_path}")
+        self._last_run_stats.setdefault("poster_preview", {
+            "message": "",
+            "image_url": "",
+        })
+        self._last_run_stats["poster_preview"] = {
+            "message": (
+                f"标题: {getattr(item, 'title', 'unknown')}\n"
+                f"类型: {item_type}\n"
+                f"分辨率: {resolution or '-'}\n"
+                f"动态范围: {dynamic_range or '-'}\n"
+                f"时长: {duration_text or '-'}\n"
+                f"评分: {rating_text or '-'}\n"
+                f"原始海报: {poster_path}\n"
+                f"叠加输出: {overlay_path}"
+            ),
+            "image_url": self._local_preview_image_url(overlay_path),
+        }
         if self._lock_metadata:
             item.lockPoster()
+
+    @staticmethod
+    def _local_preview_image_url(image_path: Path) -> str:
+        return image_path.as_posix() if image_path else ""
 
     def _verbose(self, message: str):
         if self._verbose_logging:
