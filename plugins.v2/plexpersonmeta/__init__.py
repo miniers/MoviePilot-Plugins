@@ -32,7 +32,7 @@ class PlexPersonMeta(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/miniers/MoviePilot-Plugins/main/icons/plexpersonmeta.png"
     # 插件版本
-    plugin_version = "2.4.6"
+    plugin_version = "2.4.7"
     # 插件作者
     plugin_author = "miniers"
     # 作者主页
