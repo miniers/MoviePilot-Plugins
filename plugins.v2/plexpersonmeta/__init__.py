@@ -30,13 +30,13 @@ class PlexPersonMeta(_PluginBase):
     # 插件描述
     plugin_desc = "实现刮削演职人员中文名称及角色。"
     # 插件图标
-    plugin_icon = "https://raw.githubusercontent.com/InfinityPacer/MoviePilot-Plugins/main/icons/plexpersonmeta.png"
+    plugin_icon = "https://raw.githubusercontent.com/miniers/MoviePilot-Plugins/main/icons/plexpersonmeta.png"
     # 插件版本
-    plugin_version = "2.4.4"
+    plugin_version = "2.4.5"
     # 插件作者
-    plugin_author = "InfinityPacer"
+    plugin_author = "miniers"
     # 作者主页
-    author_url = "https://github.com/InfinityPacer"
+    author_url = "https://github.com/miniers/MoviePilot-Plugins"
     # 插件配置项ID前缀
     plugin_config_prefix = "plexpersonmeta_"
     # 加载顺序
