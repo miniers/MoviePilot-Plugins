@@ -32,7 +32,7 @@ class PlexPersonMeta(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/InfinityPacer/MoviePilot-Plugins/main/icons/plexpersonmeta.png"
     # 插件版本
-    plugin_version = "2.4.2"
+    plugin_version = "2.4.3"
     # 插件作者
     plugin_author = "InfinityPacer"
     # 作者主页
@@ -1167,7 +1167,7 @@ class PlexPersonMeta(_PluginBase):
                 }
                 return
             batch_id = datetime.now().strftime("%Y%m%d%H%M%S")
-            total_stats = {"processed": 0, "changed": 0, "skipped": 0, "errors": 0, "backed_up": 0, "items": [], "skip_reasons": [], "backups": []}
+            total_stats = {"processed": 0, "changed": 0, "skipped": 0, "errors": 0, "backed_up": 0, "items": [], "changed_titles": [], "skip_reasons": [], "backups": []}
             for service_name, libraries in service_libraries.items():
                 service = self.service_info(name=service_name)
                 if not service or not service.instance:
@@ -1202,7 +1202,11 @@ class PlexPersonMeta(_PluginBase):
 
             overall_elapsed_time = time.time() - overall_start_time
             mode_text = "dry-run 预演" if run_dry else "写回模式"
-            message_text = f"演员信息{mode_text}完成，用时 {overall_elapsed_time:.2f} 秒，处理 {total_stats['processed']}，变更 {total_stats['changed']}，跳过 {total_stats['skipped']}，错误 {total_stats['errors']}"
+            message_text = (
+                f"演员信息{mode_text}完成，用时 {overall_elapsed_time:.2f} 秒，处理 {total_stats['processed']}，"
+                f"变更 {total_stats['changed']}，跳过 {total_stats['skipped']}，错误 {total_stats['errors']}"
+                f"{self.__build_message_detail(total_stats)}"
+            )
             self._last_run_stats = {
                 "summary": f"最近一次执行：来源={trigger_source}，模式={mode_text}，处理 {total_stats['processed']}，变更 {total_stats['changed']}，跳过 {total_stats['skipped']}，错误 {total_stats['errors']}，备份 {total_stats['backed_up']}。",
                 "items": total_stats["items"][-20:],
@@ -1237,7 +1241,7 @@ class PlexPersonMeta(_PluginBase):
                 return
             run_dry = self._dry_run if dry_run is None else self.__as_bool(dry_run, default=self._dry_run)
             batch_id = datetime.now().strftime("%Y%m%d%H%M%S")
-            total_stats = {"processed": 0, "changed": 0, "skipped": 0, "errors": 0, "backed_up": 0, "items": [], "skip_reasons": [], "backups": []}
+            total_stats = {"processed": 0, "changed": 0, "skipped": 0, "errors": 0, "backed_up": 0, "items": [], "changed_titles": [], "skip_reasons": [], "backups": []}
             for service_name, libraries in service_libraries.items():
                 service = self.service_info(name=service_name)
                 if not service or not service.instance:
@@ -1297,7 +1301,11 @@ class PlexPersonMeta(_PluginBase):
             overall_elapsed_time = time.time() - overall_start_time
             formatted_added_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(added_time))
             mode_text = "dry-run 预演" if run_dry else "写回模式"
-            message_text = f"最近一次入库时间：{formatted_added_time}，演员信息{mode_text}完成，用时 {overall_elapsed_time:.2f} 秒，处理 {total_stats['processed']}，变更 {total_stats['changed']}，跳过 {total_stats['skipped']}，错误 {total_stats['errors']}"
+            message_text = (
+                f"最近一次入库时间：{formatted_added_time}，演员信息{mode_text}完成，用时 {overall_elapsed_time:.2f} 秒，"
+                f"处理 {total_stats['processed']}，变更 {total_stats['changed']}，跳过 {total_stats['skipped']}，错误 {total_stats['errors']}"
+                f"{self.__build_message_detail(total_stats)}"
+            )
             self._last_run_stats = {
                 "summary": f"最近一次执行：来源={trigger_source}，范围=最近入库，模式={mode_text}，处理 {total_stats['processed']}，变更 {total_stats['changed']}，跳过 {total_stats['skipped']}，错误 {total_stats['errors']}，备份 {total_stats['backed_up']}。",
                 "items": total_stats["items"][-20:],
@@ -1354,7 +1362,19 @@ class PlexPersonMeta(_PluginBase):
         for key in ["processed", "changed", "skipped", "errors", "backed_up"]:
             total_stats[key] += int(delta.get(key, 0) or 0)
         total_stats["items"].extend(delta.get("items", []) or [])
+        total_stats["changed_titles"].extend(delta.get("changed_titles", []) or [])
         total_stats["skip_reasons"].extend(delta.get("skip_reasons", []) or [])
+
+    @staticmethod
+    def __build_message_detail(total_stats: Dict[str, Any], limit: int = 10) -> str:
+        changed_titles = [title for title in (total_stats.get("changed_titles") or []) if title]
+        if not changed_titles:
+            return ""
+        preview = "\n".join(f"- {title}" for title in changed_titles[:limit])
+        remaining = len(changed_titles) - limit
+        if remaining > 0:
+            preview = f"{preview}\n- 其余 {remaining} 项省略"
+        return f"\n\n本次有变更的条目：\n{preview}"
 
     def __data_dir(self) -> Path:
         return Path(self.get_data_path()) if hasattr(self, "get_data_path") else Path("/tmp") / "plexpersonmeta"
