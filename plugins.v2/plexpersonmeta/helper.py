@@ -61,6 +61,9 @@ class RatingInfo:
     title: Optional[str] = None  # 媒体项目的标题
     search_title: Optional[str] = None  # 用于搜索的标题
     tmdbid: Optional[int] = None  # TMDB 的唯一标识，可选
+    imdbid: Optional[str] = None  # IMDB 的唯一标识，可选
+    year: Optional[str] = None  # 年份，可选
+    season: Optional[int] = None  # 季号，可选
 
 
 def cache_with_logging(region, source):

@@ -72,6 +72,7 @@ class ScrapeHelper:
             "errors": 0,
             "backed_up": 0,
             "items": [],
+            "changed_titles": [],
             "skip_reasons": [],
         }
 
@@ -82,6 +83,8 @@ class ScrapeHelper:
         for key in ["processed", "changed", "skipped", "errors", "backed_up"]:
             target[key] += int(delta.get(key, 0) or 0)
         target["items"].extend(delta.get("items", []) or [])
+        target["changed_titles"].extend(delta.get("changed_titles", []) or [])
+        target["changed_titles"] = target["changed_titles"][-50:]
         target["skip_reasons"].extend(delta.get("skip_reasons", []) or [])
         target["skip_reasons"] = target["skip_reasons"][-50:]
         return target
@@ -192,6 +195,7 @@ class ScrapeHelper:
                 stats["processed"] += 1
                 if outcome.get("status") == "changed":
                     stats["changed"] += 1
+                    stats["changed_titles"].append(info.title)
                     if outcome.get("detail"):
                         stats["items"].append(outcome["detail"])
                     if outcome.get("backup_created"):
@@ -264,6 +268,7 @@ class ScrapeHelper:
                     stats["processed"] += 1
                     if outcome.get("status") == "changed":
                         stats["changed"] += 1
+                        stats["changed_titles"].append(episode_info.title)
                         if outcome.get("detail"):
                             stats["items"].append(outcome["detail"])
                         if outcome.get("backup_created"):
@@ -291,22 +296,24 @@ class ScrapeHelper:
         if not info:
             info = self.get_rating_info(item=item)
 
-        if not info or not info.tmdbid:
-            logger.warning(f"{info.title} 未找到tmdbid，无法识别媒体信息")
-            return {"status": "skipped", "stage": "tmdb", "reason": "未找到 tmdbid"}
-
-        logger.info(f"{info.title} 正在获取 TMDB 媒体信息")
-        mediainfo = self.get_tmdb_media(tmdbid=info.tmdbid,
-                                        title=info.search_title,
-                                        mtype=MediaType.MOVIE if item.get("type") == "movie" else MediaType.TV)
-        if not mediainfo:
-            logger.warning(f"{info.title} TMDB 未识别到媒体信息")
-            return {"status": "skipped", "stage": "tmdb", "reason": "TMDB 未识别到媒体信息"}
+        mtype = MediaType.MOVIE if item.get("type") == "movie" else MediaType.TV
+        mediainfo = None
+        if info and info.tmdbid:
+            logger.info(f"{info.title} 正在获取 TMDB 媒体信息")
+            mediainfo = self.get_tmdb_media(tmdbid=info.tmdbid, title=info.search_title, mtype=mtype)
+            if not mediainfo:
+                logger.warning(f"{info.title} TMDB 未识别到媒体信息，准备尝试豆瓣回退")
+        else:
+            logger.warning(f"{info.title} 未找到 tmdbid，准备尝试豆瓣回退")
 
         try:
             if self.need_trans_actor(item):
                 plan = self.update_peoples(item=item, mediainfo=mediainfo, info=info)
+                if not plan and self._douban_scrape:
+                    plan = self.update_peoples_with_douban(item=item, info=info, mtype=mtype)
                 if not plan:
+                    if info and not info.tmdbid:
+                        return {"status": "skipped", "stage": "tmdb", "reason": "未找到 tmdbid，且豆瓣未识别到媒体信息"}
                     return {"status": "skipped", "stage": "plan", "reason": "未生成人物变更计划"}
 
                 if self._dry_run:
@@ -513,6 +520,71 @@ class ScrapeHelper:
         changes = self._summarize_changes(original_actors, final_actors)
         if not changes:
             logger.info(f"{title} 未产生人物信息差异，跳过写回")
+            return None
+
+        return {
+            "title": title,
+            "rating_key": item.get("ratingKey"),
+            "original_actors": original_actors,
+            "actors": final_actors,
+            "changes": changes,
+        }
+
+    def update_peoples_with_douban(self, item: dict, info: Optional[RatingInfo], mtype: MediaType):
+        """在缺失 TMDB 媒体识别时，仅使用豆瓣信息生成人物变更计划。"""
+        if not info:
+            return None
+
+        title = info.title if info.title else item.get("title")
+        actors = copy.deepcopy(item.get("Role", []) or [])
+        if not actors:
+            return None
+
+        logger.info(f"{title} 正在使用豆瓣回退识别媒体信息")
+        douban_actors = self.get_douban_actors(
+            imdbid=info.imdbid,
+            title=info.search_title,
+            mtype=mtype,
+            year=info.year,
+            season=info.season,
+        )
+        if not douban_actors:
+            logger.warning(f"{title} 豆瓣未识别到媒体信息")
+            return None
+
+        original_actors = [self._actor_payload(actor) for actor in actors]
+        douban_actor_dict = {}
+        for actor in douban_actors:
+            name = actor.get("name")
+            latin_name = actor.get("latin_name")
+            if name:
+                douban_actor_dict[name] = actor
+                if StringUtils.is_chinese(name):
+                    douban_actor_dict[self.to_pinyin(name)] = actor
+            if latin_name:
+                douban_actor_dict[latin_name] = actor
+                douban_actor_dict[self.standardize_name_order(latin_name)] = actor
+
+        trans_actors = []
+        for actor in actors:
+            if self.check_external_interrupt():
+                return None
+            tag_value = actor.get("tag")
+            if not tag_value:
+                trans_actors.append(actor)
+                continue
+            actor["original_name"] = actor.get("original_name") or tag_value
+            try:
+                updated_actor = self.update_people_by_douban(people=actor, people_dict=douban_actor_dict)
+                trans_actors.append(updated_actor or actor)
+            except Exception as err:
+                logger.error(f"{title} 豆瓣回退更新人物信息失败：{str(err)}")
+                trans_actors.append(actor)
+
+        final_actors = [self._actor_payload(actor) for actor in trans_actors]
+        changes = self._summarize_changes(original_actors, final_actors)
+        if not changes:
+            logger.info(f"{title} 豆瓣回退未产生人物信息差异，跳过写回")
             return None
 
         return {
@@ -899,18 +971,28 @@ class ScrapeHelper:
         # 获取 TMDB ID
         tmdbid = (ScrapeHelper.get_tmdb_id(item=parent_item) if parent_item
                   else ScrapeHelper.get_tmdb_id(item=item))
+        imdbid = (ScrapeHelper.get_imdb_id(item=parent_item) if parent_item
+                  else ScrapeHelper.get_imdb_id(item=item))
+        year = str(parent_item.get("year") or item.get("year") or "") or None
+        season = None
 
         # 如果是剧集，调整标题格式
         if rating_type == "episode":
             parent_title = parent_item.get("title") if parent_item else item.get("grandparentTitle", title)
             title = f"{parent_title} - {ScrapeHelper.get_season_episode(item=item)} - {title}"
             search_title = parent_title
+            season = int(item.get("parentIndex")) if str(item.get("parentIndex", "")).isdigit() else None
+        elif rating_type == "season":
+            season = int(item.get("index")) if str(item.get("index", "")).isdigit() else None
 
         return RatingInfo(key=key,
                           type=rating_type,
                           title=title,
                           search_title=search_title,
-                          tmdbid=tmdbid)
+                          tmdbid=tmdbid,
+                          imdbid=imdbid,
+                          year=year,
+                          season=season)
 
     def list_rating_items(self, library: LibrarySection):
         """获取所有媒体项目"""
@@ -993,6 +1075,22 @@ class ScrapeHelper:
                 parts = guid_id.split("tmdb://")
                 if len(parts) == 2 and parts[1].isdigit():
                     return int(parts[1])
+        return None
+
+    @staticmethod
+    def get_imdb_id(item) -> Optional[str]:
+        """获取 imdb_id"""
+        if not item:
+            return None
+        guids = item.get("Guid", [])
+        if not guids:
+            return None
+        for guid in guids:
+            guid_id = guid.get("id", "")
+            if guid_id.startswith("imdb://"):
+                parts = guid_id.split("imdb://")
+                if len(parts) == 2 and parts[1]:
+                    return parts[1]
         return None
 
     def check_external_interrupt(self, service: Optional[str] = None) -> bool:
