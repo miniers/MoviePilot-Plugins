@@ -3,11 +3,12 @@
     "name": "Plex演职人员刮削",
     "description": "实现刮削演职人员中文名称及角色。",
     "labels": "Plex,刮削",
-    "version": "2.4.3",
+    "version": "2.4.4",
     "icon": "https://raw.githubusercontent.com/miniers/MoviePilot-Plugins/main/icons/plexpersonmeta.png",
     "author": "miniers",
     "level": 1,
     "history": {
+      "v2.4.4": "修复最近入库场景下 Plex 条目缺失 tmdbid 时直接跳过的问题，改为回退使用豆瓣识别；同时在执行通知中附带本次实际发生变更的条目名称。",
       "v2.4.3": "支持在 Plex 条目缺失 tmdbid 时回退使用豆瓣识别演员信息，并在执行通知中附带本次实际发生变更的条目名称。",
       "v2.4.2": "修复关闭 dry-run 后仍因字符串布尔值被误判为预演模式的问题，并统一配置/API/运行入口的布尔解析。",
       "v2.4.1": "补齐上一版遗漏提交的源码文件，正式发布 dry-run 预演、最近执行结果页、手动触发命令/API，以及写回前演员备份与恢复最近一次备份能力。",
