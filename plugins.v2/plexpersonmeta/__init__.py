@@ -32,7 +32,7 @@ class PlexPersonMeta(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/InfinityPacer/MoviePilot-Plugins/main/icons/plexpersonmeta.png"
     # 插件版本
-    plugin_version = "2.4.1"
+    plugin_version = "2.4.2"
     # 插件作者
     plugin_author = "InfinityPacer"
     # 作者主页
@@ -82,6 +82,23 @@ class PlexPersonMeta(_PluginBase):
 
     # endregion
 
+    @staticmethod
+    def __as_bool(value: Any, default: bool = False) -> bool:
+        """将配置或 API 入参稳定解析为布尔值，避免字符串假值被 `bool()` 误判。"""
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "on", "y"}:
+                return True
+            if normalized in {"0", "false", "no", "off", "n", ""}:
+                return False
+        return bool(value)
+
     def init_plugin(self, config: dict = None):
         self.mediaserver_helper = MediaServerHelper()
         if not config:
@@ -90,16 +107,16 @@ class PlexPersonMeta(_PluginBase):
         self._onlyonce = config.get("onlyonce")
         self._cron = config.get("cron")
         self._notify = config.get("notify")
-        self._lock = bool(config.get("lock"))
+        self._lock = self.__as_bool(config.get("lock"), default=False)
         self._libraries = config.get("libraries", [])
         self._clear_cache = config.get("clear_cache")
         self._execute_transfer = config.get("execute_transfer")
         self._scrape_type = config.get("scrape_type", "all") or "all"
-        self._remove_no_zh = bool(config.get("remove_no_zh", False))
-        self._douban_scrape = bool(config.get("douban_scrape", True))
-        self._dry_run = bool(config.get("dry_run", True))
-        self._backup_enabled = bool(config.get("backup_enabled", True))
-        self._restore_backup = bool(config.get("restore_backup", False))
+        self._remove_no_zh = self.__as_bool(config.get("remove_no_zh"), default=False)
+        self._douban_scrape = self.__as_bool(config.get("douban_scrape"), default=True)
+        self._dry_run = self.__as_bool(config.get("dry_run"), default=True)
+        self._backup_enabled = self.__as_bool(config.get("backup_enabled"), default=True)
+        self._restore_backup = self.__as_bool(config.get("restore_backup"), default=False)
         try:
             self._delay = int(config.get("delay", 200))
         except ValueError:
@@ -933,13 +950,16 @@ class PlexPersonMeta(_PluginBase):
         payload = data or {}
         mode = payload.get("mode", "full") if isinstance(payload, dict) else "full"
         dry_run = payload.get("dry_run") if isinstance(payload, dict) else None
-        restore = bool(payload.get("restore_last_backup")) if isinstance(payload, dict) else False
+        restore = self.__as_bool(payload.get("restore_last_backup"), default=False) if isinstance(payload, dict) else False
 
         if restore:
             threading.Thread(target=self.restore_last_backup, daemon=True).start()
             return {"success": True, "message": "恢复任务已启动", "restore": True}
 
-        kwargs = {"dry_run": self._dry_run if dry_run is None else bool(dry_run), "trigger_source": "api"}
+        kwargs = {
+            "dry_run": self._dry_run if dry_run is None else self.__as_bool(dry_run, default=self._dry_run),
+            "trigger_source": "api"
+        }
         target = self.scrape_library
         if mode == "recent":
             added_time = datetime.now(tz=pytz.timezone(settings.TZ)) - timedelta(minutes=max(self._cron_added_time or 60, 1))
@@ -1113,7 +1133,7 @@ class PlexPersonMeta(_PluginBase):
         """
         刮削媒体库中所有媒体的演员信息
         """
-        run_dry = self._dry_run if dry_run is None else bool(dry_run)
+        run_dry = self._dry_run if dry_run is None else self.__as_bool(dry_run, default=self._dry_run)
         if not self.__check_plex_media_server():
             self._last_run_stats = {
                 "summary": "Plex 配置不正确或未选择媒体库，无法执行任务。",
@@ -1215,7 +1235,7 @@ class PlexPersonMeta(_PluginBase):
                     "backups": [],
                 }
                 return
-            run_dry = self._dry_run if dry_run is None else bool(dry_run)
+            run_dry = self._dry_run if dry_run is None else self.__as_bool(dry_run, default=self._dry_run)
             batch_id = datetime.now().strftime("%Y%m%d%H%M%S")
             total_stats = {"processed": 0, "changed": 0, "skipped": 0, "errors": 0, "backed_up": 0, "items": [], "skip_reasons": [], "backups": []}
             for service_name, libraries in service_libraries.items():
