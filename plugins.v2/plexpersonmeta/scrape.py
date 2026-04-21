@@ -973,7 +973,8 @@ class ScrapeHelper:
                   else ScrapeHelper.get_tmdb_id(item=item))
         imdbid = (ScrapeHelper.get_imdb_id(item=parent_item) if parent_item
                   else ScrapeHelper.get_imdb_id(item=item))
-        year = str(parent_item.get("year") or item.get("year") or "") or None
+        year_source = parent_item.get("year") if parent_item else None
+        year = str(year_source or item.get("year") or "") or None
         season = None
 
         # 如果是剧集，调整标题格式
