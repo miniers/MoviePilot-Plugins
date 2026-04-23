@@ -65,6 +65,8 @@ class MPPlexTools(_PluginBase):
     _backup_retention_days = 30
     _last_run_stats: Dict[str, Any] = {}
     _recent_skip_reasons: List[Dict[str, str]] = []
+    _processed_index: Optional[Dict[str, List[str]]] = None
+    _processed_index_dirty = False
 
     _default_tags = {
         "Anime": "动画",
@@ -560,11 +562,14 @@ class MPPlexTools(_PluginBase):
             "recent_only": recent_only,
             "run_mode": current_run_mode,
             "services": [],
+            "processed_titles": [],
             "processed": 0,
             "skipped": 0,
             "errors": 0,
         }
+        self._last_run_stats = stats
         self._cleanup_old_backups()
+        self._ensure_processed_index_loaded()
         with lock:
             total = 0
             for service in self._service_infos().values():
@@ -588,6 +593,7 @@ class MPPlexTools(_PluginBase):
                     stats["services"].append(
                         f"{service.name}/{section.title}: processed={processed}, skipped={skipped}, errors={errors}"
                     )
+            self._flush_processed_index()
             stats["finished_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             scope = "最近条目" if recent_only else "全量媒体库"
             stats["summary"] = (
@@ -600,7 +606,10 @@ class MPPlexTools(_PluginBase):
                 self.post_message(
                     mtype=NotificationType.SiteMessage,
                     title=f"【{self.plugin_name}】",
-                    text=f"{scope}整理完成，处理条目 {total} 个，模式：{current_run_mode}",
+                    text=(
+                        f"{scope}整理完成，处理条目 {total} 个，模式：{current_run_mode}"
+                        f"{self._build_message_detail(stats)}"
+                    ),
                 )
 
     def _cleanup_old_backups(self):
@@ -636,7 +645,9 @@ class MPPlexTools(_PluginBase):
             item = self._wait_for_transfer_item(service, plex, section, target_path, title)
             if item:
                 with lock:
+                    self._ensure_processed_index_loaded()
                     self._process_item(item, trigger_source="transfer")
+                    self._flush_processed_index()
                 return
 
     def _match_transfer_section(self, service: ServiceInfo, plex, target_path: str) -> Optional[LibrarySection]:
@@ -805,7 +816,8 @@ class MPPlexTools(_PluginBase):
                     count += 1
                 else:
                     skipped += 1
-                    self._record_skip_reason(item, "process", "当前配置或条目条件下未执行任何变更")
+                    if not self._has_recent_skip_reason(item):
+                        self._record_skip_reason(item, "process", "当前配置或条目条件下未执行任何变更")
             except Exception as err:
                 logger.error(f"处理 {section.title}/{getattr(item, 'title', 'unknown')} 失败: {err}")
                 errors += 1
@@ -871,7 +883,8 @@ class MPPlexTools(_PluginBase):
                     count += 1
                 else:
                     skipped += 1
-                    self._record_skip_reason(collection, "collection", "当前配置下合集未执行任何变更")
+                    if not self._has_recent_skip_reason(collection):
+                        self._record_skip_reason(collection, "collection", "当前配置下合集未执行任何变更")
             except Exception as err:
                 logger.error(f"处理合集 {section.title}/{getattr(collection, 'title', 'unknown')} 失败: {err}")
                 errors += 1
@@ -885,13 +898,20 @@ class MPPlexTools(_PluginBase):
         ignore_overlay_marker: bool = False,
         trigger_source: str = "manual",
     ) -> bool:
+        if self._should_skip_processed_item(item, run_mode=run_mode, trigger_source=trigger_source):
+            self._record_skip_reason(item, "processed", "该条目已整理过，当前仅“立即运行一次”会强制重复整理")
+            return False
         if run_mode == "run_locked":
             self._lock_item_images(item)
             self._process_related_children(item, run_mode=run_mode, trigger_source=trigger_source)
+            self._mark_item_processed(item, run_mode=run_mode)
+            self._record_processed_title(item)
             return True
         if run_mode == "run_unlocked":
             self._unlock_item_images(item)
             self._process_related_children(item, run_mode=run_mode, trigger_source=trigger_source)
+            self._mark_item_processed(item, run_mode=run_mode)
+            self._record_processed_title(item)
             return True
         changed = False
         if self._fanart:
@@ -912,15 +932,125 @@ class MPPlexTools(_PluginBase):
             ignore_overlay_marker=ignore_overlay_marker,
             trigger_source=trigger_source,
         )
-        return changed or (self._overlay_poster and getattr(item, "type", "") in {"show", "season"})
+        processed = changed or (self._overlay_poster and getattr(item, "type", "") in {"show", "season"})
+        if processed:
+            self._mark_item_processed(item, run_mode=run_mode)
+            self._record_processed_title(item)
+        return processed
 
     def _record_skip_reason(self, item, stage: str, reason: str):
         self._recent_skip_reasons.append({
+            "item_key": self._processed_item_key(item),
             "title": getattr(item, "title", "unknown") or "unknown",
             "stage": stage,
             "reason": reason,
         })
         self._recent_skip_reasons = self._recent_skip_reasons[-50:]
+
+    def _has_recent_skip_reason(self, item) -> bool:
+        if not self._recent_skip_reasons:
+            return False
+        item_key = self._processed_item_key(item)
+        if item_key:
+            return self._recent_skip_reasons[-1].get("item_key") == item_key
+        return self._recent_skip_reasons[-1].get("title") == (getattr(item, "title", "unknown") or "unknown")
+
+    def _record_processed_title(self, item):
+        title = getattr(item, "title", "") or ""
+        if not title:
+            return
+        processed_titles = self._last_run_stats.setdefault("processed_titles", [])
+        if title not in processed_titles:
+            processed_titles.append(title)
+
+    @staticmethod
+    def _should_force_reprocess(trigger_source: str) -> bool:
+        return trigger_source == "onlyonce"
+
+    def _should_skip_processed_item(self, item, run_mode: str, trigger_source: str) -> bool:
+        if self._should_force_reprocess(trigger_source):
+            return False
+        item_key = self._processed_item_key(item)
+        if not item_key:
+            return False
+        self._ensure_processed_index_loaded()
+        profile = self._processing_profile(run_mode)
+        profiles = (self._processed_index or {}).get(item_key, [])
+        return profile in profiles
+
+    def _mark_item_processed(self, item, run_mode: str):
+        item_key = self._processed_item_key(item)
+        if not item_key:
+            return
+        self._ensure_processed_index_loaded()
+        profile = self._processing_profile(run_mode)
+        profiles = (self._processed_index or {}).setdefault(item_key, [])
+        if profile not in profiles:
+            profiles.append(profile)
+            self._processed_index_dirty = True
+
+    def _processing_profile(self, run_mode: str) -> str:
+        if run_mode in {"run_locked", "run_unlocked"}:
+            return run_mode
+        flags = [
+            f"fanart={int(self._fanart)}",
+            f"translate_tags={int(self._translate_tags)}",
+            f"sort_title={int(self._sort_title)}",
+            f"overlay_poster={int(self._overlay_poster)}",
+            f"lock_metadata={int(self._lock_metadata)}",
+        ]
+        return f"{run_mode}|{'|'.join(flags)}"
+
+    def _processed_item_key(self, item) -> str:
+        item_type = getattr(item, "type", "unknown") or "unknown"
+        raw_key = getattr(item, "ratingKey", None) or getattr(item, "key", None)
+        if raw_key:
+            return f"{item_type}:{raw_key}"
+        title = getattr(item, "title", "") or "unknown"
+        return f"{item_type}:title:{title}"
+
+    def _ensure_processed_index_loaded(self):
+        if self._processed_index is not None:
+            return
+        path = self._processed_index_path()
+        try:
+            if path.exists():
+                self._processed_index = json.loads(path.read_text(encoding="utf-8")) or {}
+            else:
+                self._processed_index = {}
+        except Exception as err:
+            logger.warning(f"{self.plugin_name} 读取已整理索引失败，改用空索引继续执行: {err}")
+            self._processed_index = {}
+        self._processed_index_dirty = False
+
+    def _flush_processed_index(self):
+        if not self._processed_index_dirty or self._processed_index is None:
+            return
+        path = self._processed_index_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(self._processed_index, ensure_ascii=False, indent=2), encoding="utf-8")
+            self._processed_index_dirty = False
+        except Exception as err:
+            logger.warning(f"{self.plugin_name} 保存已整理索引失败: {err}")
+
+    def _processed_index_path(self) -> Path:
+        return self._data_dir() / "processed_items.json"
+
+    def _data_dir(self) -> Path:
+        return Path(self.get_data_path()) if hasattr(self, "get_data_path") else Path("/tmp") / "mpplextools"
+
+    @staticmethod
+    def _build_message_detail(stats: Dict[str, Any], limit: int = 10) -> str:
+        changed_titles = [title for title in (stats.get("processed_titles") or []) if title]
+        if not changed_titles:
+            return ""
+        unique_titles = list(dict.fromkeys(changed_titles))
+        preview = "\n".join(f"- {title}" for title in unique_titles[:limit])
+        remaining = len(unique_titles) - limit
+        if remaining > 0:
+            preview = f"{preview}\n- 其余 {remaining} 项省略"
+        return f"\n\n本次处理条目：\n{preview}"
 
     def _lock_item_images(self, item):
         try:
