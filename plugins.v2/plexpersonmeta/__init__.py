@@ -32,7 +32,7 @@ class PlexPersonMeta(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/miniers/MoviePilot-Plugins/main/icons/plexpersonmeta.png"
     # 插件版本
-    plugin_version = "2.4.7"
+    plugin_version = "2.4.8"
     # 插件作者
     plugin_author = "miniers"
     # 作者主页
@@ -258,7 +258,7 @@ class PlexPersonMeta(_PluginBase):
                 "name": f"{self.plugin_name}服务",
                 "trigger": CronTrigger.from_crontab(self._cron),
                 "func": self.scrape_library,
-                "kwargs": {"trigger_source": "schedule"}
+                "func_kwargs": {"trigger_source": "schedule"}
             }]
 
     def stop_service(self):
