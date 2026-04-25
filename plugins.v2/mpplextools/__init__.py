@@ -30,7 +30,7 @@ class MPPlexTools(_PluginBase):
     plugin_name = "MP Plex工具箱"
     plugin_desc = "为 MoviePilot V2 提供 Plex 中文本地化、Fanart 封面优选和海报信息叠加。"
     plugin_icon = "https://github.com/miniers/MoviePilot-Plugins/blob/main/icons/mpplextools.jpg?raw=true"
-    plugin_version = "0.1.13"
+    plugin_version = "0.1.14"
     plugin_author = "miniers"
     author_url = "https://github.com/miniers/MoviePilot-Plugins"
     plugin_config_prefix = "mpplextools_"
@@ -606,10 +606,7 @@ class MPPlexTools(_PluginBase):
                 self.post_message(
                     mtype=NotificationType.SiteMessage,
                     title=f"【{self.plugin_name}】",
-                    text=(
-                        f"{scope}整理完成，处理条目 {total} 个，模式：{current_run_mode}"
-                        f"{self._build_message_detail(stats)}"
-                    ),
+                    text=self._build_notification_text(stats, scope=scope, run_mode=current_run_mode, total=total),
                 )
 
     def _cleanup_old_backups(self):
@@ -950,10 +947,12 @@ class MPPlexTools(_PluginBase):
     def _has_recent_skip_reason(self, item) -> bool:
         if not self._recent_skip_reasons:
             return False
-        item_key = self._processed_item_key(item)
-        if item_key:
-            return self._recent_skip_reasons[-1].get("item_key") == item_key
-        return self._recent_skip_reasons[-1].get("title") == (getattr(item, "title", "unknown") or "unknown")
+        recent = self._recent_skip_reasons[-1]
+        item_keys = self._processed_item_keys(item)
+        recent_key = recent.get("item_key")
+        if recent_key and recent_key in item_keys:
+            return True
+        return recent.get("title") == (getattr(item, "title", "unknown") or "unknown")
 
     def _record_processed_title(self, item):
         title = getattr(item, "title", "") or ""
@@ -970,24 +969,40 @@ class MPPlexTools(_PluginBase):
     def _should_skip_processed_item(self, item, run_mode: str, trigger_source: str) -> bool:
         if self._should_force_reprocess(trigger_source):
             return False
-        item_key = self._processed_item_key(item)
-        if not item_key:
+        item_keys = self._processed_item_keys(item)
+        if not item_keys:
             return False
         self._ensure_processed_index_loaded()
         profile = self._processing_profile(run_mode)
-        profiles = (self._processed_index or {}).get(item_key, [])
-        return profile in profiles
+        for item_key in item_keys:
+            profiles = (self._processed_index or {}).get(item_key, [])
+            if profile in profiles:
+                self._verbose(
+                    f"{getattr(item, 'title', 'unknown')} 命中已整理索引，跳过本次处理: key={item_key} profile={profile} source={trigger_source}"
+                )
+                return True
+        self._verbose(
+            f"{getattr(item, 'title', 'unknown')} 未命中已整理索引: keys={item_keys} profile={profile} source={trigger_source}"
+        )
+        return False
 
     def _mark_item_processed(self, item, run_mode: str):
-        item_key = self._processed_item_key(item)
-        if not item_key:
+        item_keys = self._processed_item_keys(item)
+        if not item_keys:
             return
         self._ensure_processed_index_loaded()
         profile = self._processing_profile(run_mode)
-        profiles = (self._processed_index or {}).setdefault(item_key, [])
-        if profile not in profiles:
-            profiles.append(profile)
+        changed = False
+        for item_key in item_keys:
+            profiles = (self._processed_index or {}).setdefault(item_key, [])
+            if profile not in profiles:
+                profiles.append(profile)
+                changed = True
+        if changed:
             self._processed_index_dirty = True
+            self._verbose(
+                f"{getattr(item, 'title', 'unknown')} 已写入整理索引: keys={item_keys} profile={profile}"
+            )
 
     def _processing_profile(self, run_mode: str) -> str:
         if run_mode in {"run_locked", "run_unlocked"}:
@@ -1002,12 +1017,62 @@ class MPPlexTools(_PluginBase):
         return f"{run_mode}|{'|'.join(flags)}"
 
     def _processed_item_key(self, item) -> str:
+        keys = self._processed_item_keys(item)
+        return keys[0] if keys else ""
+
+    def _processed_item_keys(self, item) -> List[str]:
         item_type = getattr(item, "type", "unknown") or "unknown"
-        raw_key = getattr(item, "ratingKey", None) or getattr(item, "key", None)
+        keys: List[str] = []
+
+        def add_key(kind: str, value) -> None:
+            normalized = str(value or "").strip()
+            if not normalized:
+                return
+            key = f"{item_type}:{kind}:{normalized}"
+            if key not in keys:
+                keys.append(key)
+
+        add_key("rating", getattr(item, "ratingKey", None))
+        raw_key = getattr(item, "key", None)
+        add_key("key", raw_key)
         if raw_key:
-            return f"{item_type}:{raw_key}"
-        title = getattr(item, "title", "") or "unknown"
-        return f"{item_type}:title:{title}"
+            normalized_raw_key = str(raw_key).strip("/")
+            if normalized_raw_key.isdigit():
+                add_key("rating", normalized_raw_key)
+            elif normalized_raw_key.startswith("library/metadata/"):
+                add_key("rating", normalized_raw_key.rsplit("/", 1)[-1])
+
+        for guid_prefix in ["plex", "tmdb", "tvdb", "imdb"]:
+            add_key(f"guid:{guid_prefix}", self._guid_value(item, guid_prefix))
+
+        title = (getattr(item, "title", "") or "").strip()
+        year = getattr(item, "year", None)
+        if title:
+            add_key("title", title)
+            if year not in [None, ""]:
+                add_key("title_year", f"{title}:{year}")
+
+        for path in self._item_media_paths(item):
+            add_key("path", path)
+
+        return keys
+
+    def _item_media_paths(self, item) -> List[str]:
+        paths: List[str] = []
+
+        def add_path(value) -> None:
+            normalized = str(value or "").strip().replace("\\", "/")
+            if normalized and normalized not in paths:
+                paths.append(normalized)
+
+        for location in getattr(item, "locations", []) or []:
+            add_path(location)
+
+        media = self._preferred_media(item)
+        if media:
+            for part in self._safe_parts(media):
+                add_path(getattr(part, "file", ""))
+        return paths
 
     def _ensure_processed_index_loaded(self):
         if self._processed_index is not None:
@@ -1022,6 +1087,7 @@ class MPPlexTools(_PluginBase):
             logger.warning(f"{self.plugin_name} 读取已整理索引失败，改用空索引继续执行: {err}")
             self._processed_index = {}
         self._processed_index_dirty = False
+        self._verbose(f"已加载整理索引: {path}，条目数={len(self._processed_index or {})}")
 
     def _flush_processed_index(self):
         if not self._processed_index_dirty or self._processed_index is None:
@@ -1031,6 +1097,7 @@ class MPPlexTools(_PluginBase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps(self._processed_index, ensure_ascii=False, indent=2), encoding="utf-8")
             self._processed_index_dirty = False
+            self._verbose(f"已保存整理索引: {path}，条目数={len(self._processed_index or {})}")
         except Exception as err:
             logger.warning(f"{self.plugin_name} 保存已整理索引失败: {err}")
 
@@ -1051,6 +1118,58 @@ class MPPlexTools(_PluginBase):
         if remaining > 0:
             preview = f"{preview}\n- 其余 {remaining} 项省略"
         return f"\n\n本次处理条目：\n{preview}"
+
+    def _build_notification_text(self, stats: Dict[str, Any], scope: str, run_mode: str, total: int) -> str:
+        sections = [
+            f"{scope}整理完成，处理条目 {total} 个，模式：{run_mode}",
+            (
+                f"触发来源：{self._trigger_source_label(stats.get('trigger_source', 'manual'))}\n"
+                f"开始时间：{stats.get('started_at', '-')}\n"
+                f"完成时间：{stats.get('finished_at', '-')}\n"
+                f"处理统计：处理 {stats.get('processed', 0)}，跳过 {stats.get('skipped', 0)}，错误 {stats.get('errors', 0)}"
+            ),
+        ]
+
+        service_detail = self._build_service_detail(stats)
+        if service_detail:
+            sections.append(service_detail)
+
+        processed_detail = self._build_message_detail(stats)
+        if processed_detail:
+            sections.append(processed_detail.strip())
+
+        skip_detail = self._build_skip_detail()
+        if skip_detail:
+            sections.append(skip_detail)
+
+        return "\n\n".join(section for section in sections if section)
+
+    @staticmethod
+    def _build_service_detail(stats: Dict[str, Any], limit: int = 6) -> str:
+        services = [str(item).strip() for item in (stats.get("services") or []) if str(item).strip()]
+        if not services:
+            return ""
+        preview = "\n".join(f"- {item}" for item in services[:limit])
+        remaining = len(services) - limit
+        if remaining > 0:
+            preview = f"{preview}\n- 其余 {remaining} 个媒体库省略"
+        return f"媒体库明细：\n{preview}"
+
+    def _build_skip_detail(self, limit: int = 8) -> str:
+        skip_reasons = self._recent_skip_reasons or []
+        if not skip_reasons:
+            return ""
+        preview_lines = []
+        for item in skip_reasons[:limit]:
+            title = item.get("title") or "unknown"
+            stage = item.get("stage") or "skip"
+            reason = item.get("reason") or ""
+            preview_lines.append(f"- {title} [{stage}] {reason}".strip())
+        preview = "\n".join(preview_lines)
+        remaining = len(skip_reasons) - limit
+        if remaining > 0:
+            preview = f"{preview}\n- 其余 {remaining} 项跳过记录省略"
+        return f"跳过摘要：\n{preview}"
 
     def _lock_item_images(self, item):
         try:
