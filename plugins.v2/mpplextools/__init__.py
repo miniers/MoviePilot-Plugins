@@ -910,29 +910,41 @@ class MPPlexTools(_PluginBase):
             self._mark_item_processed(item, run_mode=run_mode)
             self._record_processed_title(item)
             return True
+        handled = False
         changed = False
         if self._fanart:
-            self._apply_fanart(item)
-            changed = True
+            feature_handled, feature_changed = self._apply_fanart(item)
+            handled = feature_handled or handled
+            changed = feature_changed or changed
         if self._translate_tags:
-            self._translate_item_tags(item)
-            changed = True
+            feature_handled, feature_changed = self._translate_item_tags(item)
+            handled = feature_handled or handled
+            changed = feature_changed or changed
         if self._sort_title:
-            self._update_sort_title(item)
-            changed = True
+            feature_handled, feature_changed = self._update_sort_title(item)
+            handled = feature_handled or handled
+            changed = feature_changed or changed
         if self._overlay_poster and getattr(item, "type", "") not in {"show", "season"}:
-            self._overlay_item_poster(item, ignore_overlay_marker=ignore_overlay_marker, trigger_source=trigger_source)
-            changed = True
-        self._process_related_children(
+            feature_handled, feature_changed = self._overlay_item_poster(
+                item,
+                ignore_overlay_marker=ignore_overlay_marker,
+                trigger_source=trigger_source,
+            )
+            handled = feature_handled or handled
+            changed = feature_changed or changed
+        child_handled, child_changed = self._process_related_children(
             item,
             run_mode=run_mode,
             ignore_overlay_marker=ignore_overlay_marker,
             trigger_source=trigger_source,
         )
-        processed = changed or (self._overlay_poster and getattr(item, "type", "") in {"show", "season"})
+        handled = child_handled or handled
+        changed = child_changed or changed
+        processed = handled or changed
         if processed:
             self._mark_item_processed(item, run_mode=run_mode)
-            self._record_processed_title(item)
+            if changed:
+                self._record_processed_title(item)
         return processed
 
     def _record_skip_reason(self, item, stage: str, reason: str):
@@ -1195,7 +1207,7 @@ class MPPlexTools(_PluginBase):
         run_mode: str = "run_all",
         ignore_overlay_marker: bool = False,
         trigger_source: str = "manual",
-    ):
+    ) -> Tuple[bool, bool]:
         item_type = getattr(item, "type", "")
         if run_mode in {"run_locked", "run_unlocked"}:
             targets = []
@@ -1205,52 +1217,98 @@ class MPPlexTools(_PluginBase):
                 elif item_type == "season":
                     targets.extend(item.episodes() or [])
             except Exception:
-                return
+                return False, False
             for child in targets:
                 if run_mode == "run_locked":
                     self._lock_item_images(child)
                 else:
                     self._unlock_item_images(child)
-            return
+            return bool(targets), bool(targets)
 
         if not self._overlay_poster:
-            return
+            return False, False
+        handled = False
+        changed = False
         try:
             if item_type == "show":
-                self._overlay_item_poster(item, ignore_overlay_marker=ignore_overlay_marker, trigger_source=trigger_source)
+                item_handled, item_changed = self._overlay_item_poster(
+                    item,
+                    ignore_overlay_marker=ignore_overlay_marker,
+                    trigger_source=trigger_source,
+                )
+                handled = item_handled or handled
+                changed = item_changed or changed
                 for season in item.seasons() or []:
-                    self._overlay_item_poster(season, ignore_overlay_marker=ignore_overlay_marker, trigger_source=trigger_source)
+                    season_handled, season_changed = self._overlay_item_poster(
+                        season,
+                        ignore_overlay_marker=ignore_overlay_marker,
+                        trigger_source=trigger_source,
+                    )
+                    handled = season_handled or handled
+                    changed = season_changed or changed
                     for episode in season.episodes() or []:
-                        self._overlay_item_poster(episode, ignore_overlay_marker=ignore_overlay_marker, trigger_source=trigger_source)
+                        episode_handled, episode_changed = self._overlay_item_poster(
+                            episode,
+                            ignore_overlay_marker=ignore_overlay_marker,
+                            trigger_source=trigger_source,
+                        )
+                        handled = episode_handled or handled
+                        changed = episode_changed or changed
             elif item_type == "season":
-                self._overlay_item_poster(item, ignore_overlay_marker=ignore_overlay_marker, trigger_source=trigger_source)
+                item_handled, item_changed = self._overlay_item_poster(
+                    item,
+                    ignore_overlay_marker=ignore_overlay_marker,
+                    trigger_source=trigger_source,
+                )
+                handled = item_handled or handled
+                changed = item_changed or changed
                 for episode in item.episodes() or []:
-                    self._overlay_item_poster(episode, ignore_overlay_marker=ignore_overlay_marker, trigger_source=trigger_source)
+                    episode_handled, episode_changed = self._overlay_item_poster(
+                        episode,
+                        ignore_overlay_marker=ignore_overlay_marker,
+                        trigger_source=trigger_source,
+                    )
+                    handled = episode_handled or handled
+                    changed = episode_changed or changed
         except Exception as err:
             logger.debug(f"处理关联海报失败: {err}")
+        return handled, changed
 
-    def _apply_fanart(self, item):
+    def _apply_fanart(self, item) -> Tuple[bool, bool]:
+        handled = False
+        changed = False
         locked = self._locked_fields(item)
+        posters = item.posters() or []
+        selected = next((poster for poster in posters if getattr(poster, "provider", "") == "fanarttv"), None)
+        if selected:
+            handled = True
         if "thumb" not in locked:
-            posters = item.posters() or []
-            selected = next((poster for poster in posters if getattr(poster, "provider", "") == "fanarttv"), None)
             if selected:
-                item.setPoster(selected)
+                if not getattr(selected, "selected", False):
+                    item.setPoster(selected)
+                    changed = True
                 if self._lock_metadata:
                     item.lockPoster()
+                    changed = True
+        arts = item.arts() or []
+        selected = next((art for art in arts if getattr(art, "provider", "") == "fanarttv"), None)
+        if selected:
+            handled = True
         if "art" not in locked:
-            arts = item.arts() or []
-            selected = next((art for art in arts if getattr(art, "provider", "") == "fanarttv"), None)
             if selected:
-                item.setArt(selected)
+                if not getattr(selected, "selected", False):
+                    item.setArt(selected)
+                    changed = True
                 if self._lock_metadata:
                     item.lockArt()
+                    changed = True
+        return handled, changed
 
-    def _translate_item_tags(self, item):
+    def _translate_item_tags(self, item) -> Tuple[bool, bool]:
         tags = self._tags()
         genres = list(getattr(item, "genres", []) or [])
         if not genres:
-            return
+            return False, False
         english = []
         chinese = []
         existing = {genre.tag for genre in genres if hasattr(genre, "tag")}
@@ -1264,18 +1322,30 @@ class MPPlexTools(_PluginBase):
             item.addGenre(chinese, locked=self._lock_metadata)
         if english:
             item.removeGenre(english, locked=self._lock_metadata)
+        handled = bool(chinese or english) or any(name in tags.values() for name in existing)
+        return handled, bool(chinese or english)
 
-    def _update_sort_title(self, item):
+    def _update_sort_title(self, item) -> Tuple[bool, bool]:
         locked = self._locked_fields(item)
         if "titleSort" in locked:
-            return
+            return False, False
+        if not hasattr(item, "editSortTitle"):
+            self._verbose(f"{getattr(item, 'title', 'unknown')} 当前条目类型不支持设置 titleSort，跳过拼音排序")
+            return False, False
         title = getattr(item, "title", "") or ""
         if not title:
-            return
+            return False, False
         letters = pypinyin.pinyin(title, style=pypinyin.FIRST_LETTER, heteronym=False)
         sort_title = "".join((entry[0] or "").upper() for entry in letters)
+        if not sort_title:
+            return False, False
+        current_sort_title = str(getattr(item, "titleSort", "") or "").strip()
+        if current_sort_title == sort_title:
+            return True, False
         if sort_title:
             item.editSortTitle(sort_title)
+            return True, True
+        return False, False
 
 
     @staticmethod
@@ -1289,15 +1359,17 @@ class MPPlexTools(_PluginBase):
             "manual": "手动任务",
         }.get(trigger_source, "当前任务")
 
-    def _overlay_item_poster(self, item, ignore_overlay_marker: bool = False, trigger_source: str = "manual"):
+    def _overlay_item_poster(self, item, ignore_overlay_marker: bool = False, trigger_source: str = "manual") -> Tuple[bool, bool]:
         item_type = getattr(item, "type", "")
         if item_type not in {"movie", "show", "season", "episode"}:
             self._record_skip_reason(item, "overlay", f"不支持的条目类型: {item_type}")
-            return
+            return False, False
         poster_path = self._source_poster_path(item, ignore_overlay_marker=ignore_overlay_marker, trigger_source=trigger_source)
         if not poster_path:
+            if not ignore_overlay_marker and self._current_selected_poster_has_overlay(item):
+                return True, False
             self._record_skip_reason(item, "overlay", "未找到可用于叠加的原始海报")
-            return
+            return False, False
         resolution, dynamic_range, duration_text, rating_text = self._media_overlay_info(item)
         self._verbose(
             f"{getattr(item, 'title', 'unknown')} 海报叠加参数: 分辨率={resolution or '-'} 动态范围={dynamic_range or '-'} 时长={duration_text or '-'} 评分={rating_text or '-'}"
@@ -1333,6 +1405,19 @@ class MPPlexTools(_PluginBase):
         }
         if self._lock_metadata:
             item.lockPoster()
+        return True, True
+
+    def _current_selected_poster_has_overlay(self, item) -> bool:
+        current_url = getattr(item, "posterUrl", "") or ""
+        title = getattr(item, "title", "unknown")
+        if not current_url:
+            return False
+        try:
+            _, current_has_overlay = self._download_non_overlay_poster(current_url, title, "当前已选")
+            return current_has_overlay
+        except Exception as err:
+            self._verbose(f"{title} 检查当前海报 overlay 标记失败: {err}")
+            return False
 
     @staticmethod
     def _local_preview_image_url(image_path: Path) -> str:
