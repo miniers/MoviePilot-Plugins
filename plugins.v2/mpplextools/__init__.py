@@ -218,7 +218,7 @@ class MPPlexTools(_PluginBase):
                 "name": self.plugin_name,
                 "trigger": CronTrigger.from_crontab(self._cron),
                 "func": self.run_full_scan,
-                "kwargs": {"trigger_source": "schedule"},
+                "func_kwargs": {"trigger_source": "schedule"},
             }]
         return []
 
